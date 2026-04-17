@@ -1,15 +1,40 @@
 mod fs;
 mod yadisk;
 
-use std::{env, path::PathBuf, process};
+use std::{
+    env, io,
+    path::{Path, PathBuf},
+    process,
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread,
+    time::Duration,
+};
 
 use dotenvy::dotenv;
 use fs::YandexDiskFs;
-use fuser::{Config, MountOption};
+use fuser::{BackgroundSession, Config, MountOption};
+use signal_hook::{
+    consts::signal::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use yadisk::YandexDiskClient;
+
+const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn usage() -> &'static str {
     "usage: discohack-daemon <mountpoint>"
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .finish();
+
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 fn load_token() -> Result<String, String> {
@@ -35,30 +60,150 @@ fn mountpoint_from_args() -> Result<PathBuf, String> {
         .ok_or_else(|| usage().to_owned())
 }
 
-fn main() {
-    dotenv().ok();
+enum ShutdownTrigger {
+    Signal(&'static str),
+    SessionEnded,
+}
 
+fn install_signal_handlers() -> io::Result<Receiver<&'static str>> {
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let (tx, rx) = mpsc::channel();
+
+    thread::Builder::new()
+        .name("signal-listener".to_owned())
+        .spawn(move || {
+            for signal in signals.forever() {
+                let name = match signal {
+                    SIGINT => "SIGINT",
+                    SIGTERM => "SIGTERM",
+                    _ => "UNKNOWN",
+                };
+
+                if tx.send(name).is_err() {
+                    break;
+                }
+            }
+        })?;
+
+    Ok(rx)
+}
+
+fn finalize_session(
+    session: &mut Option<BackgroundSession>,
+    mountpoint: &Path,
+    trigger: ShutdownTrigger,
+) -> i32 {
+    let Some(session) = session.take() else {
+        warn!(mountpoint = %mountpoint.display(), "shutdown already completed");
+        return 0;
+    };
+
+    match trigger {
+        ShutdownTrigger::Signal(signal) => {
+            info!(
+                signal,
+                mountpoint = %mountpoint.display(),
+                "starting graceful shutdown"
+            );
+
+            match session.umount_and_join() {
+                Ok(()) => {
+                    info!(mountpoint = %mountpoint.display(), "graceful shutdown complete");
+                    0
+                }
+                Err(err) => {
+                    error!(
+                        signal,
+                        mountpoint = %mountpoint.display(),
+                        error = %err,
+                        "graceful shutdown failed"
+                    );
+                    1
+                }
+            }
+        }
+        ShutdownTrigger::SessionEnded => match session.join() {
+            Ok(()) => {
+                info!(mountpoint = %mountpoint.display(), "filesystem session ended");
+                0
+            }
+            Err(err) => {
+                error!(
+                    mountpoint = %mountpoint.display(),
+                    error = %err,
+                    "filesystem session ended with an error"
+                );
+                1
+            }
+        },
+    }
+}
+
+fn wait_for_shutdown(
+    session: BackgroundSession,
+    mountpoint: &Path,
+    shutdown_rx: Receiver<&'static str>,
+) -> i32 {
+    let mut session = Some(session);
+    let mut signal_listener_alive = true;
+
+    loop {
+        if session
+            .as_ref()
+            .is_some_and(|session| session.guard.is_finished())
+        {
+            return finalize_session(&mut session, mountpoint, ShutdownTrigger::SessionEnded);
+        }
+
+        if signal_listener_alive {
+            match shutdown_rx.recv_timeout(SESSION_POLL_INTERVAL) {
+                Ok(signal) => {
+                    return finalize_session(
+                        &mut session,
+                        mountpoint,
+                        ShutdownTrigger::Signal(signal),
+                    );
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    signal_listener_alive = false;
+                    warn!("signal listener stopped unexpectedly; waiting for session to end");
+                }
+            }
+        } else {
+            thread::sleep(SESSION_POLL_INTERVAL);
+        }
+    }
+}
+
+fn run() -> i32 {
     let mountpoint = match mountpoint_from_args() {
         Ok(path) => path,
         Err(message) => {
-            eprintln!("{message}");
-            process::exit(2);
+            error!(usage = usage(), error = %message, "invalid command line arguments");
+            return 2;
         }
     };
+
+    info!(mountpoint = %mountpoint.display(), "starting discohack-daemon");
 
     let token = match load_token() {
         Ok(token) => token,
         Err(message) => {
-            eprintln!("{message}");
-            process::exit(2);
+            error!(mountpoint = %mountpoint.display(), error = %message, "missing configuration");
+            return 2;
         }
     };
 
     let client = match YandexDiskClient::new(token) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("failed to initialize Yandex Disk client: {err}");
-            process::exit(1);
+            error!(
+                mountpoint = %mountpoint.display(),
+                error = %err,
+                "failed to initialize Yandex Disk client"
+            );
+            return 1;
         }
     };
 
@@ -68,8 +213,24 @@ fn main() {
     let fs = match YandexDiskFs::new(client, uid, gid) {
         Ok(fs) => fs,
         Err(err) => {
-            eprintln!("failed to initialize Yandex Disk filesystem: {err}");
-            process::exit(1);
+            error!(
+                mountpoint = %mountpoint.display(),
+                error = %err,
+                "failed to initialize Yandex Disk filesystem"
+            );
+            return 1;
+        }
+    };
+
+    let shutdown_rx = match install_signal_handlers() {
+        Ok(rx) => rx,
+        Err(err) => {
+            error!(
+                mountpoint = %mountpoint.display(),
+                error = %err,
+                "failed to install signal handlers"
+            );
+            return 1;
         }
     };
 
@@ -79,8 +240,25 @@ fn main() {
         MountOption::FSName("yandex-disk-ro".into()),
     ];
 
-    if let Err(err) = fuser::mount2(fs, &mountpoint, &config) {
-        eprintln!("failed to mount {}: {err}", mountpoint.display());
-        process::exit(1);
-    }
+    info!(mountpoint = %mountpoint.display(), "mounting filesystem");
+    let session = match fuser::spawn_mount2(fs, &mountpoint, &config) {
+        Ok(session) => session,
+        Err(err) => {
+            error!(
+                mountpoint = %mountpoint.display(),
+                error = %err,
+                "failed to mount filesystem"
+            );
+            return 1;
+        }
+    };
+
+    info!(mountpoint = %mountpoint.display(), "filesystem mounted");
+    wait_for_shutdown(session, &mountpoint, shutdown_rx)
+}
+
+fn main() {
+    dotenv().ok();
+    init_tracing();
+    process::exit(run());
 }

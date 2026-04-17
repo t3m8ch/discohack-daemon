@@ -38,10 +38,23 @@ ls -la /tmp/yadisk-mnt
 cat /tmp/yadisk-mnt/some-file.txt
 ```
 
-Unmount when finished:
+Stop the daemon with `Ctrl-C` or `SIGTERM` for a graceful shutdown. The daemon now attempts to unmount the FUSE mount before exiting so the same mountpoint can be reused immediately.
+
+If graceful cleanup fails unexpectedly, recover the mountpoint manually:
 
 ```bash
 fusermount -u /tmp/yadisk-mnt
+```
+
+## Logging
+
+The daemon uses `tracing` for structured lifecycle logs.
+
+- Default log level: `info`
+- Override with `RUST_LOG`, for example:
+
+```bash
+RUST_LOG=debug cargo run -- /tmp/yadisk-mnt
 ```
 
 ## Current behavior
