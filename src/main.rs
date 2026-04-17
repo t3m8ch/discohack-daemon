@@ -22,6 +22,8 @@ use tracing_subscriber::EnvFilter;
 use yadisk::YandexDiskClient;
 
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_FUSE_WORKER_THREADS: usize = 2;
+const MAX_FUSE_WORKER_THREADS: usize = 8;
 
 fn usage() -> &'static str {
     "usage: discohack-daemon <mountpoint>"
@@ -176,6 +178,31 @@ fn wait_for_shutdown(
     }
 }
 
+fn configure_fuse_session(config: &mut Config) -> usize {
+    let worker_threads = thread::available_parallelism()
+        .map(|parallelism| {
+            parallelism
+                .get()
+                .clamp(MIN_FUSE_WORKER_THREADS, MAX_FUSE_WORKER_THREADS)
+        })
+        .unwrap_or(MIN_FUSE_WORKER_THREADS);
+
+    #[cfg(target_os = "linux")]
+    {
+        // fuser only supports n_threads > 1 on Linux, so keep the tuning local to the
+        // platform where the daemon currently runs.
+        config.n_threads = Some(worker_threads);
+        config.clone_fd = worker_threads > 1;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = worker_threads;
+    }
+
+    config.n_threads.unwrap_or(1)
+}
+
 fn run() -> i32 {
     let mountpoint = match mountpoint_from_args() {
         Ok(path) => path,
@@ -239,8 +266,14 @@ fn run() -> i32 {
         MountOption::RO,
         MountOption::FSName("yandex-disk-ro".into()),
     ];
+    let worker_threads = configure_fuse_session(&mut config);
 
-    info!(mountpoint = %mountpoint.display(), "mounting filesystem");
+    info!(
+        mountpoint = %mountpoint.display(),
+        worker_threads,
+        clone_fd = config.clone_fd,
+        "mounting filesystem"
+    );
     let session = match fuser::spawn_mount2(fs, &mountpoint, &config) {
         Ok(session) => session,
         Err(err) => {

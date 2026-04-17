@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -18,14 +18,39 @@ const METADATA_CACHE_TTL: Duration = Duration::from_secs(5);
 const DOWNLOAD_URL_TTL: Duration = Duration::from_secs(300);
 const ROOT_PATH: &str = "disk:/";
 
+trait RemoteClient: Send + Sync {
+    fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError>;
+    fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError>;
+    fn resolve_download_url(&self, path: &str) -> Result<String, YandexError>;
+    fn read_file_range(&self, href: &str, offset: u64, size: u32) -> Result<Vec<u8>, YandexError>;
+}
+
+impl RemoteClient for YandexDiskClient {
+    fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
+        YandexDiskClient::fetch_resource_metadata(self, path)
+    }
+
+    fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError> {
+        YandexDiskClient::list_directory(self, path)
+    }
+
+    fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
+        YandexDiskClient::resolve_download_url(self, path)
+    }
+
+    fn read_file_range(&self, href: &str, offset: u64, size: u32) -> Result<Vec<u8>, YandexError> {
+        YandexDiskClient::read_file_range(self, href, offset, size)
+    }
+}
+
 pub struct YandexDiskFs {
+    client: Arc<dyn RemoteClient>,
     state: Mutex<FsState>,
     uid: u32,
     gid: u32,
 }
 
 struct FsState {
-    client: YandexDiskClient,
     next_ino: u64,
     entries: HashMap<INodeNo, Entry>,
     path_to_ino: HashMap<String, INodeNo>,
@@ -68,10 +93,31 @@ impl From<YandexError> for FsError {
     }
 }
 
+enum EntryRefreshPlan {
+    Ready(Entry),
+    Fetch { path: String, parent: INodeNo },
+}
+
+enum DirectoryLoadPlan {
+    Ready,
+    Fetch { path: String },
+}
+
+enum DownloadUrlPlan {
+    Ready(String),
+    Fetch { path: String },
+}
+
 impl YandexDiskFs {
     pub fn new(client: YandexDiskClient, uid: u32, gid: u32) -> Result<Self, YandexError> {
-        let state = FsState::new(client)?;
+        Self::with_client(Arc::new(client), uid, gid)
+    }
+
+    fn with_client(client: Arc<dyn RemoteClient>, uid: u32, gid: u32) -> Result<Self, YandexError> {
+        let root = client.fetch_resource_metadata(ROOT_PATH)?;
+        let state = FsState::new(root);
         Ok(Self {
+            client,
             state: Mutex::new(state),
             uid,
             gid,
@@ -103,6 +149,113 @@ impl YandexDiskFs {
             flags: 0,
         }
     }
+
+    fn lookup_entry(&self, parent: INodeNo, name: &str) -> Result<Entry, FsError> {
+        self.ensure_directory_loaded(parent)?;
+        let child_ino = {
+            let state = self.state.lock().unwrap();
+            state.lookup_cached_child(parent, name)?
+        };
+        self.getattr_entry(child_ino)
+    }
+
+    fn getattr_entry(&self, ino: INodeNo) -> Result<Entry, FsError> {
+        self.ensure_entry_fresh(ino)
+    }
+
+    fn readdir_listing(&self, ino: INodeNo) -> Result<Vec<(INodeNo, FileType, String)>, FsError> {
+        self.ensure_directory_loaded(ino)?;
+        let state = self.state.lock().unwrap();
+        state.readdir_snapshot(ino)
+    }
+
+    fn read_data(&self, ino: INodeNo, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
+        let entry = self.getattr_entry(ino)?;
+        if entry.kind != EntryKind::File {
+            return Err(FsError::IsDir);
+        }
+        if offset >= entry.size || size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let href = self.download_url_for(ino)?;
+        match self.client.read_file_range(&href, offset, size) {
+            Ok(bytes) => Ok(bytes),
+            Err(YandexError::Forbidden)
+            | Err(YandexError::Unauthorized)
+            | Err(YandexError::NotFound) => {
+                self.invalidate_download_url(ino);
+                let refreshed = self.download_url_for(ino)?;
+                Ok(self.client.read_file_range(&refreshed, offset, size)?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn ensure_entry_fresh(&self, ino: INodeNo) -> Result<Entry, FsError> {
+        loop {
+            let plan = {
+                let state = self.state.lock().unwrap();
+                state.entry_refresh_plan(ino)?
+            };
+
+            match plan {
+                EntryRefreshPlan::Ready(entry) => return Ok(entry),
+                EntryRefreshPlan::Fetch { path, parent } => {
+                    let fresh = self.client.fetch_resource_metadata(&path)?;
+                    let mut state = self.state.lock().unwrap();
+                    state.upsert_entry(parent, fresh);
+                }
+            }
+        }
+    }
+
+    fn ensure_directory_loaded(&self, ino: INodeNo) -> Result<(), FsError> {
+        loop {
+            let entry = self.ensure_entry_fresh(ino)?;
+            if entry.kind != EntryKind::Directory {
+                return Err(FsError::NotDir);
+            }
+
+            let plan = {
+                let state = self.state.lock().unwrap();
+                state.directory_load_plan(ino)?
+            };
+
+            match plan {
+                DirectoryLoadPlan::Ready => return Ok(()),
+                DirectoryLoadPlan::Fetch { path } => {
+                    let children = self.client.list_directory(&path)?;
+                    let mut state = self.state.lock().unwrap();
+                    state.replace_directory_children(ino, children);
+                }
+            }
+        }
+    }
+
+    fn download_url_for(&self, ino: INodeNo) -> Result<String, FsError> {
+        loop {
+            let plan = {
+                let state = self.state.lock().unwrap();
+                state.download_url_plan(ino)?
+            };
+
+            match plan {
+                DownloadUrlPlan::Ready(url) => return Ok(url),
+                DownloadUrlPlan::Fetch { path } => {
+                    let url = self.client.resolve_download_url(&path)?;
+                    let mut state = self.state.lock().unwrap();
+                    state.cache_download_url(ino, url.clone())?;
+                    return Ok(url);
+                }
+            }
+        }
+    }
+
+    fn invalidate_download_url(&self, ino: INodeNo) {
+        let mut state = self.state.lock().unwrap();
+        state.invalidate_download_url(ino);
+    }
 }
 
 impl Filesystem for YandexDiskFs {
@@ -115,16 +268,14 @@ impl Filesystem for YandexDiskFs {
             }
         };
 
-        let mut state = self.state.lock().unwrap();
-        match state.lookup(parent, name) {
+        match self.lookup_entry(parent, name) {
             Ok(entry) => reply.entry(&TTL, &self.attr_for(&entry), Generation(0)),
             Err(err) => reply.error(errno_for(&err)),
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let mut state = self.state.lock().unwrap();
-        match state.getattr(ino) {
+        match self.getattr_entry(ino) {
             Ok(entry) => reply.attr(&TTL, &self.attr_for(&entry)),
             Err(err) => reply.error(errno_for(&err)),
         }
@@ -145,8 +296,7 @@ impl Filesystem for YandexDiskFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let mut state = self.state.lock().unwrap();
-        match state.getattr(ino) {
+        match self.getattr_entry(ino) {
             Ok(entry) if entry.kind == EntryKind::Directory => {
                 reply.opened(FileHandle(0), FopenFlags::empty())
             }
@@ -163,8 +313,7 @@ impl Filesystem for YandexDiskFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let mut state = self.state.lock().unwrap();
-        match state.readdir_entries(ino) {
+        match self.readdir_listing(ino) {
             Ok(entries) => {
                 for (index, (entry_ino, kind, name)) in
                     entries.into_iter().enumerate().skip(offset as usize)
@@ -186,8 +335,7 @@ impl Filesystem for YandexDiskFs {
             return;
         }
 
-        let mut state = self.state.lock().unwrap();
-        match state.getattr(ino) {
+        match self.getattr_entry(ino) {
             Ok(entry) if entry.kind == EntryKind::File => {
                 reply.opened(FileHandle(0), FopenFlags::empty())
             }
@@ -207,8 +355,7 @@ impl Filesystem for YandexDiskFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let mut state = self.state.lock().unwrap();
-        match state.read(ino, offset, size) {
+        match self.read_data(ino, offset, size) {
             Ok(data) => reply.data(&data),
             Err(err) => reply.error(errno_for(&err)),
         }
@@ -346,10 +493,8 @@ impl Filesystem for YandexDiskFs {
 }
 
 impl FsState {
-    fn new(client: YandexDiskClient) -> Result<Self, YandexError> {
-        let root = client.fetch_resource_metadata(ROOT_PATH)?;
+    fn new(root: ResourceEntry) -> Self {
         let mut state = Self {
-            client,
             next_ino: 2,
             entries: HashMap::new(),
             path_to_ino: HashMap::new(),
@@ -362,30 +507,66 @@ impl FsState {
         state
             .path_to_ino
             .insert(ROOT_PATH.to_owned(), INodeNo::ROOT);
-        Ok(state)
+        state
     }
 
-    fn lookup(&mut self, parent: INodeNo, name: &str) -> Result<Entry, FsError> {
-        self.ensure_directory_loaded(parent)?;
-        let child_ino = self
-            .dir_children
+    fn entry_refresh_plan(&self, ino: INodeNo) -> Result<EntryRefreshPlan, FsError> {
+        let entry = self.entries.get(&ino).cloned().ok_or(FsError::NotFound)?;
+        if entry.cached_at.elapsed() < METADATA_CACHE_TTL {
+            return Ok(EntryRefreshPlan::Ready(entry));
+        }
+
+        Ok(EntryRefreshPlan::Fetch {
+            path: entry.path,
+            parent: entry.parent,
+        })
+    }
+
+    fn directory_load_plan(&self, ino: INodeNo) -> Result<DirectoryLoadPlan, FsError> {
+        let entry = self.entries.get(&ino).ok_or(FsError::NotFound)?;
+        if entry.kind != EntryKind::Directory {
+            return Err(FsError::NotDir);
+        }
+
+        let is_fresh = self
+            .dir_cache_time
+            .get(&ino)
+            .map(|cached| cached.elapsed() < METADATA_CACHE_TTL)
+            .unwrap_or(false);
+        if is_fresh {
+            return Ok(DirectoryLoadPlan::Ready);
+        }
+
+        Ok(DirectoryLoadPlan::Fetch {
+            path: entry.path.clone(),
+        })
+    }
+
+    fn download_url_plan(&self, ino: INodeNo) -> Result<DownloadUrlPlan, FsError> {
+        let entry = self.entries.get(&ino).ok_or(FsError::NotFound)?;
+        if entry.kind != EntryKind::File {
+            return Err(FsError::IsDir);
+        }
+
+        if let (Some(url), Some(cached_at)) = (&entry.download_url, entry.download_url_cached_at) {
+            if cached_at.elapsed() < DOWNLOAD_URL_TTL {
+                return Ok(DownloadUrlPlan::Ready(url.clone()));
+            }
+        }
+
+        Ok(DownloadUrlPlan::Fetch {
+            path: entry.path.clone(),
+        })
+    }
+
+    fn lookup_cached_child(&self, parent: INodeNo, name: &str) -> Result<INodeNo, FsError> {
+        self.dir_children
             .get(&parent)
             .and_then(|children| children.get(name).copied())
-            .ok_or(FsError::NotFound)?;
-        self.getattr(child_ino)
+            .ok_or(FsError::NotFound)
     }
 
-    fn getattr(&mut self, ino: INodeNo) -> Result<Entry, FsError> {
-        self.ensure_entry_fresh(ino)?;
-        self.entries.get(&ino).cloned().ok_or(FsError::NotFound)
-    }
-
-    fn readdir_entries(
-        &mut self,
-        ino: INodeNo,
-    ) -> Result<Vec<(INodeNo, FileType, String)>, FsError> {
-        self.ensure_directory_loaded(ino)?;
-
+    fn readdir_snapshot(&self, ino: INodeNo) -> Result<Vec<(INodeNo, FileType, String)>, FsError> {
         let entry = self.entries.get(&ino).cloned().ok_or(FsError::NotFound)?;
         if entry.kind != EntryKind::Directory {
             return Err(FsError::NotDir);
@@ -423,113 +604,34 @@ impl FsState {
         Ok(entries)
     }
 
-    fn read(&mut self, ino: INodeNo, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
-        let entry = self.getattr(ino)?;
-        if entry.kind != EntryKind::File {
-            return Err(FsError::IsDir);
-        }
-        if offset >= entry.size || size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let href = self.download_url_for(ino)?;
-        match self.client.read_file_range(&href, offset, size) {
-            Ok(bytes) => Ok(bytes),
-            Err(YandexError::Forbidden)
-            | Err(YandexError::Unauthorized)
-            | Err(YandexError::NotFound) => {
-                if let Some(node) = self.entries.get_mut(&ino) {
-                    node.download_url = None;
-                    node.download_url_cached_at = None;
-                }
-                let refreshed = self.download_url_for(ino)?;
-                Ok(self.client.read_file_range(&refreshed, offset, size)?)
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    fn ensure_entry_fresh(&mut self, ino: INodeNo) -> Result<(), FsError> {
-        let should_refresh = self
-            .entries
-            .get(&ino)
-            .map(|entry| entry.cached_at.elapsed() >= METADATA_CACHE_TTL)
-            .ok_or(FsError::NotFound)?;
-
-        if !should_refresh {
-            return Ok(());
-        }
-
-        let (path, parent) = {
-            let entry = self.entries.get(&ino).ok_or(FsError::NotFound)?;
-            (entry.path.clone(), entry.parent)
-        };
-
-        let fresh = self.client.fetch_resource_metadata(&path)?;
-        self.upsert_entry(parent, fresh);
-        Ok(())
-    }
-
-    fn ensure_directory_loaded(&mut self, ino: INodeNo) -> Result<(), FsError> {
-        self.ensure_entry_fresh(ino)?;
-
-        let is_fresh = self
-            .dir_cache_time
-            .get(&ino)
-            .map(|cached| cached.elapsed() < METADATA_CACHE_TTL)
-            .unwrap_or(false);
-        if is_fresh {
-            let entry = self.entries.get(&ino).ok_or(FsError::NotFound)?;
-            if entry.kind != EntryKind::Directory {
-                return Err(FsError::NotDir);
-            }
-            return Ok(());
-        }
-
-        let entry = self.entries.get(&ino).cloned().ok_or(FsError::NotFound)?;
-        if entry.kind != EntryKind::Directory {
-            return Err(FsError::NotDir);
-        }
-
-        let children = self.client.list_directory(&entry.path)?;
+    fn replace_directory_children(&mut self, parent: INodeNo, children: Vec<ResourceEntry>) {
         let mut mapped = BTreeMap::new();
         for child in children {
             let name = child.name.clone();
-            let child_ino = self.upsert_entry(ino, child);
+            let child_ino = self.upsert_entry(parent, child);
             mapped.insert(name, child_ino);
         }
 
-        self.dir_children.insert(ino, mapped);
-        self.dir_cache_time.insert(ino, Instant::now());
+        self.dir_children.insert(parent, mapped);
+        self.dir_cache_time.insert(parent, Instant::now());
+    }
+
+    fn cache_download_url(&mut self, ino: INodeNo, url: String) -> Result<(), FsError> {
+        let entry = self.entries.get_mut(&ino).ok_or(FsError::NotFound)?;
+        if entry.kind != EntryKind::File {
+            return Err(FsError::IsDir);
+        }
+
+        entry.download_url = Some(url);
+        entry.download_url_cached_at = Some(Instant::now());
         Ok(())
     }
 
-    fn download_url_for(&mut self, ino: INodeNo) -> Result<String, FsError> {
-        {
-            let entry = self.entries.get(&ino).ok_or(FsError::NotFound)?;
-            if entry.kind != EntryKind::File {
-                return Err(FsError::IsDir);
-            }
-            if let (Some(url), Some(cached_at)) =
-                (&entry.download_url, entry.download_url_cached_at)
-            {
-                if cached_at.elapsed() < DOWNLOAD_URL_TTL {
-                    return Ok(url.clone());
-                }
-            }
-        }
-
-        let path = self
-            .entries
-            .get(&ino)
-            .map(|entry| entry.path.clone())
-            .ok_or(FsError::NotFound)?;
-        let url = self.client.resolve_download_url(&path)?;
+    fn invalidate_download_url(&mut self, ino: INodeNo) {
         if let Some(entry) = self.entries.get_mut(&ino) {
-            entry.download_url = Some(url.clone());
-            entry.download_url_cached_at = Some(Instant::now());
+            entry.download_url = None;
+            entry.download_url_cached_at = None;
         }
-        Ok(url)
     }
 
     fn upsert_entry(&mut self, parent: INodeNo, resource: ResourceEntry) -> INodeNo {
@@ -613,5 +715,255 @@ fn errno_for(error: &FsError) -> Errno {
         | FsError::Remote(YandexError::Http(_))
         | FsError::Remote(YandexError::Status { .. })
         | FsError::Remote(YandexError::Header(_)) => Errno::EIO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::Mutex,
+        thread,
+        time::{Duration, Instant, SystemTime},
+    };
+
+    #[derive(Default)]
+    struct FakeClient {
+        resources: Mutex<HashMap<String, ResourceEntry>>,
+        directories: Mutex<HashMap<String, Vec<ResourceEntry>>>,
+        download_urls: Mutex<HashMap<String, String>>,
+        file_contents: Mutex<HashMap<String, Vec<u8>>>,
+        metadata_delays: Mutex<HashMap<String, Duration>>,
+        read_delays: Mutex<HashMap<String, Duration>>,
+    }
+
+    impl FakeClient {
+        fn with_fixture() -> Arc<Self> {
+            let client = Arc::new(Self::default());
+            client.insert_resource(dir("disk:/", "disk:/"));
+            client.insert_resource(file("disk:/slow.txt", "slow.txt", 11));
+            client.insert_resource(file("disk:/fast.txt", "fast.txt", 11));
+            client.set_directory(
+                "disk:/",
+                vec![
+                    file("disk:/fast.txt", "fast.txt", 11),
+                    file("disk:/slow.txt", "slow.txt", 11),
+                ],
+            );
+            client.set_download_url("disk:/slow.txt", "download://slow.txt");
+            client.set_download_url("disk:/fast.txt", "download://fast.txt");
+            client.set_file_content("download://slow.txt", b"slow-content".to_vec());
+            client.set_file_content("download://fast.txt", b"fast-content".to_vec());
+            client
+        }
+
+        fn insert_resource(&self, entry: ResourceEntry) {
+            self.resources
+                .lock()
+                .unwrap()
+                .insert(entry.path.clone(), entry);
+        }
+
+        fn set_directory(&self, path: &str, entries: Vec<ResourceEntry>) {
+            self.directories
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), entries);
+        }
+
+        fn set_download_url(&self, path: &str, href: &str) {
+            self.download_urls
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), href.to_owned());
+        }
+
+        fn set_file_content(&self, href: &str, bytes: Vec<u8>) {
+            self.file_contents
+                .lock()
+                .unwrap()
+                .insert(href.to_owned(), bytes);
+        }
+
+        fn set_metadata_delay(&self, path: &str, delay: Duration) {
+            self.metadata_delays
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), delay);
+        }
+
+        fn set_read_delay(&self, href: &str, delay: Duration) {
+            self.read_delays
+                .lock()
+                .unwrap()
+                .insert(href.to_owned(), delay);
+        }
+    }
+
+    impl RemoteClient for FakeClient {
+        fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
+            if let Some(delay) = self.metadata_delays.lock().unwrap().get(path).copied() {
+                thread::sleep(delay);
+            }
+
+            self.resources
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or(YandexError::NotFound)
+        }
+
+        fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError> {
+            self.directories
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or(YandexError::NotFound)
+        }
+
+        fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
+            self.download_urls
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or(YandexError::NotFound)
+        }
+
+        fn read_file_range(
+            &self,
+            href: &str,
+            offset: u64,
+            size: u32,
+        ) -> Result<Vec<u8>, YandexError> {
+            if let Some(delay) = self.read_delays.lock().unwrap().get(href).copied() {
+                thread::sleep(delay);
+            }
+
+            let body = self
+                .file_contents
+                .lock()
+                .unwrap()
+                .get(href)
+                .cloned()
+                .ok_or(YandexError::NotFound)?;
+            let start = offset as usize;
+            if start >= body.len() {
+                return Ok(Vec::new());
+            }
+
+            let end = (start + size as usize).min(body.len());
+            Ok(body[start..end].to_vec())
+        }
+    }
+
+    fn dir(path: &str, name: &str) -> ResourceEntry {
+        ResourceEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind: ResourceKind::Directory,
+            size: 0,
+            created: Some(SystemTime::UNIX_EPOCH),
+            modified: Some(SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    fn file(path: &str, name: &str, size: u64) -> ResourceEntry {
+        ResourceEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind: ResourceKind::File,
+            size,
+            created: Some(SystemTime::UNIX_EPOCH),
+            modified: Some(SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    fn fresh_fs(client: Arc<FakeClient>) -> Arc<YandexDiskFs> {
+        Arc::new(YandexDiskFs::with_client(client, 1000, 1000).unwrap())
+    }
+
+    #[test]
+    fn slow_read_does_not_block_unrelated_getattr() {
+        let client = FakeClient::with_fixture();
+        client.set_read_delay("download://slow.txt", Duration::from_millis(250));
+        let fs = fresh_fs(client);
+
+        let slow = fs.lookup_entry(INodeNo::ROOT, "slow.txt").unwrap();
+        let fs_for_read = Arc::clone(&fs);
+        let handle = thread::spawn(move || fs_for_read.read_data(slow.ino, 0, 4).unwrap());
+
+        thread::sleep(Duration::from_millis(40));
+        let start = Instant::now();
+        let root = fs.getattr_entry(INodeNo::ROOT).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(root.ino, INodeNo::ROOT);
+        assert!(elapsed < Duration::from_millis(150));
+        assert_eq!(handle.join().unwrap(), b"slow".to_vec());
+    }
+
+    #[test]
+    fn slow_metadata_refresh_does_not_block_other_paths() {
+        let client = FakeClient::with_fixture();
+        client.set_metadata_delay("disk:/slow.txt", Duration::from_millis(250));
+        let fs = fresh_fs(client);
+
+        let slow = fs.lookup_entry(INodeNo::ROOT, "slow.txt").unwrap();
+        let fast = fs.lookup_entry(INodeNo::ROOT, "fast.txt").unwrap();
+
+        {
+            let mut state = fs.state.lock().unwrap();
+            state.entries.get_mut(&slow.ino).unwrap().cached_at =
+                Instant::now() - METADATA_CACHE_TTL - Duration::from_millis(1);
+        }
+
+        let fs_for_refresh = Arc::clone(&fs);
+        let handle = thread::spawn(move || fs_for_refresh.getattr_entry(slow.ino).unwrap());
+
+        thread::sleep(Duration::from_millis(40));
+        let start = Instant::now();
+        let fast_entry = fs.getattr_entry(fast.ino).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(fast_entry.path, "disk:/fast.txt");
+        assert!(elapsed < Duration::from_millis(150));
+        assert_eq!(handle.join().unwrap().path, "disk:/slow.txt");
+    }
+
+    #[test]
+    fn concurrent_operations_preserve_inode_and_error_mapping_semantics() {
+        let client = FakeClient::with_fixture();
+        client.set_read_delay("download://slow.txt", Duration::from_millis(250));
+        let fs = fresh_fs(client);
+
+        let first_fast = fs.lookup_entry(INodeNo::ROOT, "fast.txt").unwrap();
+        let slow = fs.lookup_entry(INodeNo::ROOT, "slow.txt").unwrap();
+
+        let fs_for_read = Arc::clone(&fs);
+        let handle = thread::spawn(move || fs_for_read.read_data(slow.ino, 0, 4).unwrap());
+
+        thread::sleep(Duration::from_millis(40));
+        let second_fast = fs.lookup_entry(INodeNo::ROOT, "fast.txt").unwrap();
+
+        assert_eq!(first_fast.ino, second_fast.ino);
+        assert!(matches!(
+            fs.read_data(INodeNo::ROOT, 0, 4),
+            Err(FsError::IsDir)
+        ));
+        assert_eq!(
+            format!("{:?}", errno_for(&FsError::IsDir)),
+            format!("{:?}", Errno::EISDIR)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                errno_for(&FsError::Remote(YandexError::Unauthorized))
+            ),
+            format!("{:?}", Errno::EACCES)
+        );
+        assert_eq!(handle.join().unwrap(), b"slow".to_vec());
     }
 }
