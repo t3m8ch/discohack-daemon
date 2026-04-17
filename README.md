@@ -5,18 +5,25 @@ Read-only FUSE mount for Yandex Disk.
 ## Requirements
 
 - Linux with FUSE support (`/dev/fuse`)
-- A Yandex Disk OAuth token
+- A running session D-Bus
+- A Secret Service provider in the user session (for example GNOME Keyring or KWallet)
 - Rust toolchain
 
 ## Configuration
 
-Create a `.env` file or export the token in your shell:
+The daemon no longer requires `YANDEX_DISK_TOKEN` in `.env` as the primary auth path.
 
-```env
-YANDEX_DISK_TOKEN=your_oauth_token_here
+Authentication is handled at runtime through:
+- D-Bus service `ru.literallycats.daemon`
+- Yandex OAuth PKCE flow
+- localhost callback `http://localhost:6532/oauth/yandex-disk`
+- Secret Service storage via the `secret-service` crate
+
+The Yandex OAuth client is configured with redirect URI:
+
+```text
+http://localhost:6532/oauth/yandex-disk
 ```
-
-The daemon also accepts `TOKEN` and `YANDEX_TOKEN`, but `YANDEX_DISK_TOKEN` is the preferred name.
 
 ## Run
 
@@ -31,7 +38,13 @@ mkdir -p /tmp/yadisk-mnt
 cargo run -- /tmp/yadisk-mnt
 ```
 
-Then inspect the mounted filesystem:
+Startup behavior:
+- the daemon registers the session-bus name `ru.literallycats.daemon`
+- it starts the OAuth callback listener on `http://localhost:6532/oauth/yandex-disk`
+- if stored credentials already exist in Secret Service, it can mount immediately
+- otherwise it stays alive with `IsAuth = false` until login completes
+
+After successful login the daemon mounts Yandex Disk automatically. Then inspect the mounted filesystem:
 
 ```bash
 ls -la /tmp/yadisk-mnt
@@ -83,6 +96,29 @@ Large files depend on HTTP performance and remote byte-range support. If the dir
 
 # Authentication
 
+The daemon exposes a D-Bus API on:
+- service: `ru.literallycats.daemon`
+- object path: `/ru/literallycats/daemon`
+- interface: `ru.literallycats.daemon`
+
+Current interface:
+- property `IsAuth`
+- method `BeginLogin()`
+- signal `LoginCompleted`
+
+`BeginLogin()` returns:
+- `authorize_url`
+- `code_challenge`
+- `redirect_uri`
+
+PKCE details:
+- the daemon generates a random `code_verifier`
+- it computes `code_challenge = BASE64URL_NO_PAD(SHA256(code_verifier))`
+- Yandex receives the `code_challenge` during `/authorize`
+- the daemon sends the original `code_verifier` to `/token`
+
+High-level flow:
+
 ```mermaid
 sequenceDiagram
     participant Y as Yandex
@@ -90,19 +126,25 @@ sequenceDiagram
     participant F as Frontend
     participant D as DBus
     participant B as Backend
-    participant S as Libsecret
+    participant S as SecretService
 
-    F->>B: Запускаем фронтенд, читаем свойство IsAuth
-    B->>F: Не авторизован
-    U->>F: Нажимаем кнопку Login
+    F->>B: Read IsAuth
+    B->>F: false
+    U->>F: Click Login
     F->>B: BeginLogin()
-    B->>F: code_challenge
-    F->>U: Открываем в браузере ссылку для Yandex OAuth
-    F->>D: Подписываемся на сигнал LoginCompleted
-    U->>Y: Тыкаем кнопку с выдачей разрешение
-    Y->>B: Яндекс на localhost шлёт code
-    B->>Y: Шлём Яндексу code_verifier, code и client_id
-    Y->>B: Access token и Refresh token
-    B->>S: Кладём Access token и Refresh token
-    B->>F: Присылаем сигнал LoginCompleted
+    B->>F: authorize_url, code_challenge, redirect_uri
+    F->>D: Subscribe LoginCompleted
+    F->>U: Open authorize_url in browser
+    U->>Y: Grant access
+    Y->>B: Redirect to http://localhost:6532/oauth/yandex-disk?code=...
+    B->>Y: POST /token with code, client_id, code_verifier
+    Y->>B: access_token, refresh_token
+    B->>S: Store tokens in Secret Service
+    B->>B: Start FUSE mount automatically
+    B->>F: Emit LoginCompleted
 ```
+
+Operational notes:
+- the daemon uses Secret Service as the persistent token store
+- access tokens are refreshed with the stored refresh token when needed
+- the mounted filesystem continues using service-managed credentials instead of `.env`

@@ -1,29 +1,27 @@
+mod auth;
+mod callback;
+mod dbus_service;
 mod fs;
+mod mount;
+mod secrets;
 mod yadisk;
 
-use std::{
-    env, io,
-    path::{Path, PathBuf},
-    process,
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
-    thread,
-    time::Duration,
-};
+use std::{env, path::PathBuf, process, sync::Arc};
 
+use auth::{AuthManager, YANDEX_CLIENT_ID, YandexOAuthClient};
+use callback::{CallbackEvent, spawn_callback_server};
+use dbus_service::{build_connection, emit_login_completed};
 use dotenvy::dotenv;
-use fs::YandexDiskFs;
-use fuser::{BackgroundSession, Config, MountOption};
-use signal_hook::{
-    consts::signal::{SIGINT, SIGTERM},
-    iterator::Signals,
+use mount::MountManager;
+use secrets::SecretServiceStore;
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::mpsc,
+    task,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use yadisk::YandexDiskClient;
-
-const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MIN_FUSE_WORKER_THREADS: usize = 2;
-const MAX_FUSE_WORKER_THREADS: usize = 8;
+use yadisk::{AccessTokenProvider, YandexDiskClient};
 
 fn usage() -> &'static str {
     "usage: discohack-daemon <mountpoint>"
@@ -39,22 +37,6 @@ fn init_tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-fn load_token() -> Result<String, String> {
-    for key in ["YANDEX_DISK_TOKEN", "TOKEN", "YANDEX_TOKEN"] {
-        if let Ok(value) = env::var(key) {
-            let token = value.trim();
-            if !token.is_empty() {
-                return Ok(token.to_owned());
-            }
-        }
-    }
-
-    Err(
-        "missing Yandex Disk OAuth token; set YANDEX_DISK_TOKEN in the environment or .env"
-            .to_owned(),
-    )
-}
-
 fn mountpoint_from_args() -> Result<PathBuf, String> {
     env::args()
         .nth(1)
@@ -62,148 +44,33 @@ fn mountpoint_from_args() -> Result<PathBuf, String> {
         .ok_or_else(|| usage().to_owned())
 }
 
-enum ShutdownTrigger {
-    Signal(&'static str),
-    SessionEnded,
-}
-
-fn install_signal_handlers() -> io::Result<Receiver<&'static str>> {
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
-    let (tx, rx) = mpsc::channel();
-
-    thread::Builder::new()
-        .name("signal-listener".to_owned())
-        .spawn(move || {
-            for signal in signals.forever() {
-                let name = match signal {
-                    SIGINT => "SIGINT",
-                    SIGTERM => "SIGTERM",
-                    _ => "UNKNOWN",
-                };
-
-                if tx.send(name).is_err() {
-                    break;
-                }
-            }
-        })?;
-
-    Ok(rx)
-}
-
-fn finalize_session(
-    session: &mut Option<BackgroundSession>,
-    mountpoint: &Path,
-    trigger: ShutdownTrigger,
-) -> i32 {
-    let Some(session) = session.take() else {
-        warn!(mountpoint = %mountpoint.display(), "shutdown already completed");
-        return 0;
-    };
-
-    match trigger {
-        ShutdownTrigger::Signal(signal) => {
-            info!(
-                signal,
-                mountpoint = %mountpoint.display(),
-                "starting graceful shutdown"
-            );
-
-            match session.umount_and_join() {
-                Ok(()) => {
-                    info!(mountpoint = %mountpoint.display(), "graceful shutdown complete");
-                    0
-                }
-                Err(err) => {
-                    error!(
-                        signal,
-                        mountpoint = %mountpoint.display(),
-                        error = %err,
-                        "graceful shutdown failed"
-                    );
-                    1
-                }
-            }
+async fn ensure_mount_started(mount_manager: Arc<MountManager>) {
+    let mountpoint = mount_manager.mountpoint().to_path_buf();
+    match task::spawn_blocking(move || mount_manager.ensure_mounted()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(mountpoint = %mountpoint.display(), error = %err, "failed to start mount")
         }
-        ShutdownTrigger::SessionEnded => match session.join() {
-            Ok(()) => {
-                info!(mountpoint = %mountpoint.display(), "filesystem session ended");
-                0
-            }
-            Err(err) => {
-                error!(
-                    mountpoint = %mountpoint.display(),
-                    error = %err,
-                    "filesystem session ended with an error"
-                );
-                1
-            }
-        },
+        Err(err) => warn!(mountpoint = %mountpoint.display(), error = %err, "mount task failed"),
     }
 }
 
-fn wait_for_shutdown(
-    session: BackgroundSession,
-    mountpoint: &Path,
-    shutdown_rx: Receiver<&'static str>,
-) -> i32 {
-    let mut session = Some(session);
-    let mut signal_listener_alive = true;
-
-    loop {
-        if session
-            .as_ref()
-            .is_some_and(|session| session.guard.is_finished())
-        {
-            return finalize_session(&mut session, mountpoint, ShutdownTrigger::SessionEnded);
+async fn shutdown_mount(mount_manager: Arc<MountManager>) -> i32 {
+    let mountpoint = mount_manager.mountpoint().to_path_buf();
+    match task::spawn_blocking(move || mount_manager.shutdown()).await {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => {
+            error!(mountpoint = %mountpoint.display(), error = %err, "mount shutdown failed");
+            1
         }
-
-        if signal_listener_alive {
-            match shutdown_rx.recv_timeout(SESSION_POLL_INTERVAL) {
-                Ok(signal) => {
-                    return finalize_session(
-                        &mut session,
-                        mountpoint,
-                        ShutdownTrigger::Signal(signal),
-                    );
-                }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    signal_listener_alive = false;
-                    warn!("signal listener stopped unexpectedly; waiting for session to end");
-                }
-            }
-        } else {
-            thread::sleep(SESSION_POLL_INTERVAL);
+        Err(err) => {
+            error!(mountpoint = %mountpoint.display(), error = %err, "mount shutdown task failed");
+            1
         }
     }
 }
 
-fn configure_fuse_session(config: &mut Config) -> usize {
-    let worker_threads = thread::available_parallelism()
-        .map(|parallelism| {
-            parallelism
-                .get()
-                .clamp(MIN_FUSE_WORKER_THREADS, MAX_FUSE_WORKER_THREADS)
-        })
-        .unwrap_or(MIN_FUSE_WORKER_THREADS);
-
-    #[cfg(target_os = "linux")]
-    {
-        // fuser only supports n_threads > 1 on Linux, so keep the tuning local to the
-        // platform where the daemon currently runs.
-        config.n_threads = Some(worker_threads);
-        config.clone_fd = worker_threads > 1;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = worker_threads;
-    }
-
-    config.n_threads.unwrap_or(1)
-}
-
-fn run() -> i32 {
+async fn run() -> i32 {
     let mountpoint = match mountpoint_from_args() {
         Ok(path) => path,
         Err(message) => {
@@ -214,84 +81,117 @@ fn run() -> i32 {
 
     info!(mountpoint = %mountpoint.display(), "starting discohack-daemon");
 
-    let token = match load_token() {
-        Ok(token) => token,
-        Err(message) => {
-            error!(mountpoint = %mountpoint.display(), error = %message, "missing configuration");
-            return 2;
+    let auth = match task::spawn_blocking(move || {
+        let oauth_client = Arc::new(YandexOAuthClient::new(YANDEX_CLIENT_ID)?);
+        let store = Arc::new(SecretServiceStore);
+        AuthManager::new(oauth_client, store)
+    })
+    .await
+    {
+        Ok(Ok(auth)) => Arc::new(auth),
+        Ok(Err(err)) => {
+            error!(error = %err, "failed to initialize auth state");
+            return 1;
+        }
+        Err(err) => {
+            error!(error = %err, "auth initialization task failed");
+            return 1;
         }
     };
 
-    let client = match YandexDiskClient::new(token) {
-        Ok(client) => client,
+    let token_provider: Arc<dyn AccessTokenProvider> = auth.clone();
+    let client = match task::spawn_blocking(move || YandexDiskClient::new(token_provider)).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            error!(error = %err, "failed to initialize Yandex Disk client");
+            return 1;
+        }
         Err(err) => {
-            error!(
-                mountpoint = %mountpoint.display(),
-                error = %err,
-                "failed to initialize Yandex Disk client"
-            );
+            error!(error = %err, "yandex client initialization task failed");
             return 1;
         }
     };
 
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
+    let mount_manager = Arc::new(MountManager::new(mountpoint.clone(), client, uid, gid));
 
-    let fs = match YandexDiskFs::new(client, uid, gid) {
-        Ok(fs) => fs,
+    let (callback_tx, mut callback_rx) = mpsc::channel(8);
+    let callback_handle = match spawn_callback_server(auth.clone(), callback_tx).await {
+        Ok(handle) => handle,
         Err(err) => {
-            error!(
-                mountpoint = %mountpoint.display(),
-                error = %err,
-                "failed to initialize Yandex Disk filesystem"
-            );
+            error!(error = %err, "failed to start OAuth callback listener");
             return 1;
         }
     };
 
-    let shutdown_rx = match install_signal_handlers() {
-        Ok(rx) => rx,
+    let connection = match build_connection(auth.clone()).await {
+        Ok(connection) => connection,
         Err(err) => {
-            error!(
-                mountpoint = %mountpoint.display(),
-                error = %err,
-                "failed to install signal handlers"
-            );
+            error!(error = %err, "failed to start D-Bus service");
+            callback_handle.abort();
             return 1;
         }
     };
 
-    let mut config = Config::default();
-    config.mount_options = vec![
-        MountOption::RO,
-        MountOption::FSName("yandex-disk-ro".into()),
-    ];
-    let worker_threads = configure_fuse_session(&mut config);
+    if auth.is_authenticated() {
+        ensure_mount_started(Arc::clone(&mount_manager)).await;
+    }
 
-    info!(
-        mountpoint = %mountpoint.display(),
-        worker_threads,
-        clone_fd = config.clone_fd,
-        "mounting filesystem"
-    );
-    let session = match fuser::spawn_mount2(fs, &mountpoint, &config) {
-        Ok(session) => session,
+    info!(service = dbus_service::BUS_NAME, mountpoint = %mountpoint.display(), authenticated = auth.is_authenticated(), "service ready");
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(signal) => signal,
         Err(err) => {
-            error!(
-                mountpoint = %mountpoint.display(),
-                error = %err,
-                "failed to mount filesystem"
-            );
-            return 1;
+            error!(error = %err, "failed to install SIGINT handler");
+            callback_handle.abort();
+            return shutdown_mount(mount_manager).await;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(err) => {
+            error!(error = %err, "failed to install SIGTERM handler");
+            callback_handle.abort();
+            return shutdown_mount(mount_manager).await;
         }
     };
 
-    info!(mountpoint = %mountpoint.display(), "filesystem mounted");
-    wait_for_shutdown(session, &mountpoint, shutdown_rx)
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!(signal = "SIGINT", "shutdown requested");
+                callback_handle.abort();
+                return shutdown_mount(mount_manager).await;
+            }
+            _ = sigterm.recv() => {
+                info!(signal = "SIGTERM", "shutdown requested");
+                callback_handle.abort();
+                return shutdown_mount(mount_manager).await;
+            }
+            maybe_event = callback_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    warn!("callback event channel closed unexpectedly");
+                    callback_handle.abort();
+                    return shutdown_mount(mount_manager).await;
+                };
+
+                match event {
+                    CallbackEvent::LoginCompleted => {
+                        ensure_mount_started(Arc::clone(&mount_manager)).await;
+                        if let Err(err) = emit_login_completed(&connection).await {
+                            warn!(error = %err, "failed to emit LoginCompleted signal");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     dotenv().ok();
     init_tracing();
-    process::exit(run());
+    process::exit(run().await);
 }

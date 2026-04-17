@@ -708,13 +708,12 @@ fn errno_for(error: &FsError) -> Errno {
         FsError::NotDir => Errno::ENOTDIR,
         FsError::IsDir => Errno::EISDIR,
         FsError::Remote(YandexError::NotFound) => Errno::ENOENT,
-        FsError::Remote(YandexError::Unauthorized) | FsError::Remote(YandexError::Forbidden) => {
-            Errno::EACCES
-        }
+        FsError::Remote(YandexError::Unauthorized)
+        | FsError::Remote(YandexError::Forbidden)
+        | FsError::Remote(YandexError::Auth(_)) => Errno::EACCES,
         FsError::Remote(YandexError::InvalidResponse(_))
         | FsError::Remote(YandexError::Http(_))
-        | FsError::Remote(YandexError::Status { .. })
-        | FsError::Remote(YandexError::Header(_)) => Errno::EIO,
+        | FsError::Remote(YandexError::Status { .. }) => Errno::EIO,
     }
 }
 

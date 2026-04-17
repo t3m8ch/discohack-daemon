@@ -1,21 +1,39 @@
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode,
     blocking::{Client, RequestBuilder, Response},
-    header::{AUTHORIZATION, HeaderMap, HeaderValue, RANGE},
+    header::{AUTHORIZATION, RANGE},
 };
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::auth::{AuthError, AuthManager};
+
 const API_BASE: &str = "https://cloud-api.yandex.net/v1/disk";
 const USER_AGENT: &str = "discohack-daemon/0.1.0";
+
+pub trait AccessTokenProvider: Send + Sync {
+    fn access_token(&self) -> Result<String, YandexError>;
+    fn refresh_access_token(&self) -> Result<String, YandexError>;
+}
+
+impl AccessTokenProvider for AuthManager {
+    fn access_token(&self) -> Result<String, YandexError> {
+        self.access_token().map_err(YandexError::from)
+    }
+
+    fn refresh_access_token(&self) -> Result<String, YandexError> {
+        self.refresh_access_token().map_err(YandexError::from)
+    }
+}
 
 #[derive(Clone)]
 pub struct YandexDiskClient {
     api: Client,
     downloads: Client,
+    auth: Arc<dyn AccessTokenProvider>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,27 +60,20 @@ pub enum YandexError {
     Unauthorized,
     #[error("Yandex Disk access denied")]
     Forbidden,
+    #[error("authentication unavailable: {0}")]
+    Auth(#[from] AuthError),
     #[error("invalid Yandex Disk response: {0}")]
     InvalidResponse(String),
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Yandex Disk returned {status}: {body}")]
     Status { status: StatusCode, body: String },
-    #[error("invalid HTTP header value: {0}")]
-    Header(#[from] reqwest::header::InvalidHeaderValue),
 }
 
 impl YandexDiskClient {
-    pub fn new(token: String) -> Result<Self, YandexError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("OAuth {token}"))?,
-        );
-
+    pub fn new(auth: Arc<dyn AccessTokenProvider>) -> Result<Self, YandexError> {
         let api = Client::builder()
             .user_agent(USER_AGENT)
-            .default_headers(headers)
             .timeout(Duration::from_secs(60))
             .build()?;
 
@@ -71,15 +82,19 @@ impl YandexDiskClient {
             .timeout(Duration::from_secs(300))
             .build()?;
 
-        Ok(Self { api, downloads })
+        Ok(Self {
+            api,
+            downloads,
+            auth,
+        })
     }
 
     pub fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
-        let response: ApiResource = self.send_json(
-            self.api
+        let response: ApiResource = self.send_json(|client| {
+            client
                 .get(format!("{API_BASE}/resources"))
-                .query(&[("path", path)]),
-        )?;
+                .query(&[("path", path)])
+        })?;
 
         response.try_into_resource()
     }
@@ -90,12 +105,13 @@ impl YandexDiskClient {
         let mut items = Vec::new();
 
         loop {
-            let response: ApiResource =
-                self.send_json(self.api.get(format!("{API_BASE}/resources")).query(&[
+            let response: ApiResource = self.send_json(|client| {
+                client.get(format!("{API_BASE}/resources")).query(&[
                     ("path", path),
                     ("limit", &limit.to_string()),
                     ("offset", &offset.to_string()),
-                ]))?;
+                ])
+            })?;
 
             let embedded = response.embedded.ok_or_else(|| {
                 YandexError::InvalidResponse(format!("directory {path} is missing _embedded"))
@@ -118,11 +134,11 @@ impl YandexDiskClient {
     }
 
     pub fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
-        let response: DownloadResponse = self.send_json(
-            self.api
+        let response: DownloadResponse = self.send_json(|client| {
+            client
                 .get(format!("{API_BASE}/resources/download"))
-                .query(&[("path", path)]),
-        )?;
+                .query(&[("path", path)])
+        })?;
 
         if response.href.trim().is_empty() {
             return Err(YandexError::InvalidResponse(format!(
@@ -173,17 +189,36 @@ impl YandexDiskClient {
         Ok(body[start..end].to_vec())
     }
 
-    fn send_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        request: RequestBuilder,
-    ) -> Result<T, YandexError> {
-        let response = request.send()?;
+    fn send_json<T: for<'de> Deserialize<'de>, F>(&self, build: F) -> Result<T, YandexError>
+    where
+        F: Fn(&Client) -> RequestBuilder,
+    {
+        let response = self.send_authorized_request(build)?;
         let status = response.status();
         if !status.is_success() {
             return Err(Self::error_from_response(response)?);
         }
 
         Ok(response.json()?)
+    }
+
+    fn send_authorized_request<F>(&self, build: F) -> Result<Response, YandexError>
+    where
+        F: Fn(&Client) -> RequestBuilder,
+    {
+        let token = self.auth.access_token()?;
+        let response = build(&self.api)
+            .header(AUTHORIZATION, format!("OAuth {token}"))
+            .send()?;
+
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+
+        let token = self.auth.refresh_access_token()?;
+        Ok(build(&self.api)
+            .header(AUTHORIZATION, format!("OAuth {token}"))
+            .send()?)
     }
 
     fn error_from_response(response: Response) -> Result<YandexError, YandexError> {
