@@ -1,0 +1,266 @@
+use std::{fmt, time::Duration};
+
+use chrono::{DateTime, Utc};
+use reqwest::{
+    StatusCode,
+    blocking::{Client, RequestBuilder, Response},
+    header::{AUTHORIZATION, HeaderMap, HeaderValue, RANGE},
+};
+use serde::Deserialize;
+use thiserror::Error;
+
+const API_BASE: &str = "https://cloud-api.yandex.net/v1/disk";
+const USER_AGENT: &str = "discohack-daemon/0.1.0";
+
+#[derive(Clone)]
+pub struct YandexDiskClient {
+    api: Client,
+    downloads: Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: ResourceKind,
+    pub size: u64,
+    pub created: Option<std::time::SystemTime>,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Error)]
+pub enum YandexError {
+    #[error("Yandex Disk entry not found")]
+    NotFound,
+    #[error("Yandex Disk authentication failed")]
+    Unauthorized,
+    #[error("Yandex Disk access denied")]
+    Forbidden,
+    #[error("invalid Yandex Disk response: {0}")]
+    InvalidResponse(String),
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("Yandex Disk returned {status}: {body}")]
+    Status { status: StatusCode, body: String },
+    #[error("invalid HTTP header value: {0}")]
+    Header(#[from] reqwest::header::InvalidHeaderValue),
+}
+
+impl YandexDiskClient {
+    pub fn new(token: String) -> Result<Self, YandexError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("OAuth {token}"))?,
+        );
+
+        let api = Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(headers)
+            .timeout(Duration::from_secs(60))
+            .build()?;
+
+        let downloads = Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
+        Ok(Self { api, downloads })
+    }
+
+    pub fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
+        let response: ApiResource = self.send_json(
+            self.api
+                .get(format!("{API_BASE}/resources"))
+                .query(&[("path", path)]),
+        )?;
+
+        response.try_into_resource()
+    }
+
+    pub fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError> {
+        let mut offset = 0usize;
+        let limit = 1000usize;
+        let mut items = Vec::new();
+
+        loop {
+            let response: ApiResource =
+                self.send_json(self.api.get(format!("{API_BASE}/resources")).query(&[
+                    ("path", path),
+                    ("limit", &limit.to_string()),
+                    ("offset", &offset.to_string()),
+                ]))?;
+
+            let embedded = response.embedded.ok_or_else(|| {
+                YandexError::InvalidResponse(format!("directory {path} is missing _embedded"))
+            })?;
+
+            let batch_size = embedded.items.len();
+            let total = embedded.total.unwrap_or(batch_size);
+
+            for item in embedded.items {
+                items.push(item.try_into_resource()?);
+            }
+
+            offset += batch_size;
+            if batch_size == 0 || offset >= total {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
+    pub fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
+        let response: DownloadResponse = self.send_json(
+            self.api
+                .get(format!("{API_BASE}/resources/download"))
+                .query(&[("path", path)]),
+        )?;
+
+        if response.href.trim().is_empty() {
+            return Err(YandexError::InvalidResponse(format!(
+                "download URL for {path} is empty"
+            )));
+        }
+
+        Ok(response.href)
+    }
+
+    pub fn read_file_range(
+        &self,
+        href: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, YandexError> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let end = offset.saturating_add(size as u64).saturating_sub(1);
+        let response = self
+            .downloads
+            .get(href)
+            .header(RANGE, format!("bytes={offset}-{end}"))
+            .send()?;
+
+        let status = response.status();
+        if status == StatusCode::PARTIAL_CONTENT {
+            return Ok(response.bytes()?.to_vec());
+        }
+
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Vec::new());
+        }
+
+        if !status.is_success() {
+            return Err(Self::error_from_response(response)?);
+        }
+
+        let body = response.bytes()?;
+        let start = offset as usize;
+        if start >= body.len() {
+            return Ok(Vec::new());
+        }
+
+        let end = (start + size as usize).min(body.len());
+        Ok(body[start..end].to_vec())
+    }
+
+    fn send_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<T, YandexError> {
+        let response = request.send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::error_from_response(response)?);
+        }
+
+        Ok(response.json()?)
+    }
+
+    fn error_from_response(response: Response) -> Result<YandexError, YandexError> {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| String::from("<unable to read body>"));
+        let error = match status {
+            StatusCode::NOT_FOUND => YandexError::NotFound,
+            StatusCode::UNAUTHORIZED => YandexError::Unauthorized,
+            StatusCode::FORBIDDEN => YandexError::Forbidden,
+            _ => YandexError::Status { status, body },
+        };
+        Err(error)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiResource {
+    path: String,
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    size: Option<u64>,
+    created: Option<String>,
+    modified: Option<String>,
+    #[serde(rename = "_embedded")]
+    embedded: Option<ApiEmbedded>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEmbedded {
+    items: Vec<ApiResource>,
+    total: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadResponse {
+    href: String,
+}
+
+impl ApiResource {
+    fn try_into_resource(self) -> Result<ResourceEntry, YandexError> {
+        let kind = match self.kind.as_str() {
+            "dir" => ResourceKind::Directory,
+            "file" => ResourceKind::File,
+            other => {
+                return Err(YandexError::InvalidResponse(format!(
+                    "unsupported resource type {other} for {}",
+                    self.path
+                )));
+            }
+        };
+
+        Ok(ResourceEntry {
+            path: self.path,
+            name: self.name,
+            kind,
+            size: self.size.unwrap_or(0),
+            created: parse_time(self.created.as_deref()),
+            modified: parse_time(self.modified.as_deref()),
+        })
+    }
+}
+
+fn parse_time(value: Option<&str>) -> Option<std::time::SystemTime> {
+    let raw = value?;
+    let parsed = DateTime::parse_from_rfc3339(raw).ok()?;
+    let utc: DateTime<Utc> = parsed.with_timezone(&Utc);
+    Some(utc.into())
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceKind::Directory => write!(f, "dir"),
+            ResourceKind::File => write!(f, "file"),
+        }
+    }
+}
