@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode,
     blocking::{Body, Client, RequestBuilder, Response},
-    header::{AUTHORIZATION, RANGE},
+    header::AUTHORIZATION,
     redirect::Policy,
 };
 use serde::Deserialize;
@@ -49,7 +49,9 @@ pub struct ResourceEntry {
     pub name: String,
     pub kind: ResourceKind,
     pub size: u64,
+    #[allow(dead_code)]
     pub created: Option<std::time::SystemTime>,
+    #[allow(dead_code)]
     pub modified: Option<std::time::SystemTime>,
     pub remote_version: Option<String>,
 }
@@ -221,46 +223,6 @@ impl YandexDiskClient {
         Ok(response.bytes()?.to_vec())
     }
 
-    pub fn read_file_range(
-        &self,
-        href: &str,
-        offset: u64,
-        size: u32,
-    ) -> Result<Vec<u8>, YandexError> {
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let end = offset.saturating_add(size as u64).saturating_sub(1);
-        let response = self
-            .transfers
-            .get(href)
-            .header(RANGE, format!("bytes={offset}-{end}"))
-            .send()?;
-
-        let status = response.status();
-        if status == StatusCode::PARTIAL_CONTENT {
-            return Ok(response.bytes()?.to_vec());
-        }
-
-        if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            return Ok(Vec::new());
-        }
-
-        if !status.is_success() {
-            return Err(Self::error_from_response(response)?);
-        }
-
-        let body = response.bytes()?;
-        let start = offset as usize;
-        if start >= body.len() {
-            return Ok(Vec::new());
-        }
-
-        let end = (start + size as usize).min(body.len());
-        Ok(body[start..end].to_vec())
-    }
-
     fn send_json<T: for<'de> Deserialize<'de>, F>(&self, build: F) -> Result<T, YandexError>
     where
         F: Fn(&Client) -> RequestBuilder,
@@ -299,8 +261,6 @@ impl YandexDiskClient {
             if status == StatusCode::NO_CONTENT {
                 return Ok(TransferLink {
                     href: String::new(),
-                    method: String::new(),
-                    templated: false,
                 });
             }
 
@@ -351,8 +311,6 @@ struct ApiEmbedded {
 #[derive(Debug, Deserialize)]
 struct TransferLink {
     href: String,
-    method: String,
-    templated: bool,
 }
 
 impl ApiResource {

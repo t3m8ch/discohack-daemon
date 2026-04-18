@@ -47,16 +47,12 @@ impl MountManager {
         &self.mountpoint
     }
 
-    pub fn is_mounted(&self) -> bool {
-        self.session.lock().unwrap().is_some()
-    }
-
     pub fn ensure_mounted(&self) -> Result<(), MountError> {
         let mut session_guard = self.session.lock().unwrap();
-        if let Some(existing) = session_guard.as_ref() {
-            if !existing.guard.is_finished() {
-                return Ok(());
-            }
+        if let Some(existing) = session_guard.as_ref()
+            && !existing.guard.is_finished()
+        {
+            return Ok(());
         }
 
         if let Some(finished) = session_guard.take() {

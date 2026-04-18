@@ -8,7 +8,6 @@ use crate::sync::SyncService;
 
 pub const BUS_NAME: &str = "ru.literallycats.daemon";
 pub const OBJECT_PATH: &str = "/ru/literallycats/daemon";
-pub const INTERFACE_NAME: &str = "ru.literallycats.daemon";
 
 pub struct DaemonInterface {
     auth: Arc<AuthManager>,
