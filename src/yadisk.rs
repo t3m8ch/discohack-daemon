@@ -2,10 +2,10 @@ use std::{fmt, fs::File, path::Path, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use reqwest::{
-    StatusCode,
     blocking::{Body, Client, RequestBuilder, Response},
     header::{AUTHORIZATION, RANGE},
     redirect::Policy,
+    StatusCode,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -51,6 +51,7 @@ pub struct ResourceEntry {
     pub size: u64,
     pub created: Option<std::time::SystemTime>,
     pub modified: Option<std::time::SystemTime>,
+    pub remote_version: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -335,6 +336,10 @@ struct ApiResource {
     size: Option<u64>,
     created: Option<String>,
     modified: Option<String>,
+    revision: Option<u64>,
+    md5: Option<String>,
+    sha256: Option<String>,
+    resource_id: Option<String>,
     #[serde(rename = "_embedded")]
     embedded: Option<ApiEmbedded>,
 }
@@ -372,6 +377,13 @@ impl ApiResource {
             size: self.size.unwrap_or(0),
             created: parse_time(self.created.as_deref()),
             modified: parse_time(self.modified.as_deref()),
+            remote_version: self
+                .revision
+                .map(|revision| revision.to_string())
+                .or(self.sha256)
+                .or(self.md5)
+                .or(self.modified)
+                .or(self.resource_id),
         })
     }
 }
@@ -421,6 +433,10 @@ mod tests {
             size: None,
             created: None,
             modified: None,
+            revision: None,
+            md5: None,
+            sha256: None,
+            resource_id: None,
             embedded: None,
         }
         .try_into_resource()

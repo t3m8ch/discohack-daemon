@@ -76,40 +76,79 @@ RUST_LOG=debug cargo run -- /tmp/yadisk-mnt
 ## Current behavior
 
 - Exposes `disk:/` as the mount root
-- Supports directory traversal via `lookup`, `getattr`, and `readdir`
-- Supports regular file reads through Yandex Disk download URLs
-- Supports writable opens, file creation, writes, truncation, flush/fsync commit, and release-time commit
-- Supports `mkdir`, `unlink`, `rmdir`, and `rename`
-- Uses short-lived metadata and download-URL caching to reduce repeated API calls
-- Uses local staging files for writable handles and uploads the full staged file back to Yandex Disk on commit
+- Supports local-first directory traversal, file reads, writes, truncation, `mkdir`, `unlink`, `rmdir`, and `rename`
+- Uses SQLite as persistent metadata and queue storage
+- Uses local cached files under the daemon state directory as the client-visible source of truth
+- Queues remote mutations and refresh work for background sync instead of doing network work directly in write callbacks
+- Recovers pending sync work after daemon restart
+- Detects remote/local version conflicts and preserves both copies with numeric suffixes such as `file (2).txt`
 
-## Save semantics
+## Offline-First Semantics
 
-Writes are implemented as a write-back filesystem:
+Writes are now local-first:
 
-- opening an existing file for write stages the current remote contents in a local temp file
+- opening an existing file for write stages the current local cached bytes in a temp file
 - `write` and `truncate` modify that staged file locally
-- `flush`, `fsync`, and final `release` upload the whole staged file back to Yandex Disk
-- a failed upload returns an error and leaves the previous remote contents authoritative
+- `flush`, `fsync`, and final `release` commit the staged bytes into the local cache and enqueue a persistent sync job
+- background workers later upload, delete, rename, mkdir, refresh metadata, and hydrate missing file bytes
+- if the network is unavailable, local reads and writes continue against local state and queued work is retried later
 
-## Limitations
+Reads are also local-first:
 
-- Writes are whole-file uploads, not remote block patches
-- Large writes depend on local temp storage and full upload latency
-- `mknod` and other advanced filesystem operations are still not implemented
-- Behavior for complex concurrent mutation patterns follows a practical first implementation rather than full POSIX parity in every edge case
+- directory listings and attributes come from persistent metadata
+- file bytes come from the local cache when present
+- placeholder files are downloaded lazily on first read
 
-# Authentication
+## State Root
+
+The daemon keeps sync state under:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/discohack-daemon/
+```
+
+Important contents:
+
+- `metadata.db`: SQLite metadata, queue, leases, and conflicts
+- `cache/`: local hydrated file contents
+
+## D-Bus API
 
 The daemon exposes a D-Bus API on:
+
 - service: `ru.literallycats.daemon`
 - object path: `/ru/literallycats/daemon`
 - interface: `ru.literallycats.daemon`
 
-Current interface:
+Auth properties and methods:
+
 - property `IsAuth`
 - method `BeginLogin()`
 - signal `LoginCompleted`
+
+Sync properties and methods:
+
+- property `MountPoint: s`
+- property `SyncSummary: a{sv}`
+- property `SyncItems: aa{sv}`
+- method `GetSyncStatus(path: s) -> a{sv}`
+- method `ListDirectoryStatuses(path: s) -> aa{sv}`
+- method `RequestRefresh(path: s)`
+
+Global sync updates are emitted via standard `org.freedesktop.DBus.Properties.PropertiesChanged`.
+
+## Limitations
+
+- Writes are still whole-file uploads, not remote block patches
+- Periodic tree refresh is a safe baseline; provider-native delta sync is not implemented yet
+- Lazy hydration currently downloads missing file bytes during the requesting filesystem operation
+- `mknod` and other advanced filesystem operations are still not implemented
+
+More detail is in `docs/offline-first-sync.md`.
+
+# Authentication
+
+The auth flow continues to use the same D-Bus service and PKCE flow. The D-Bus interface now also includes sync state properties and path status methods described above.
 
 `BeginLogin()` returns:
 - `authorize_url`

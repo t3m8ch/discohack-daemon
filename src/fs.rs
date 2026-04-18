@@ -14,12 +14,14 @@ use fuser::{
 };
 use rand::random;
 
-use crate::yadisk::{ResourceEntry, ResourceKind, YandexDiskClient, YandexError};
+use crate::{
+    sync::{NodeKind, StoredEntry, SyncError, SyncService, ROOT_PATH},
+    yadisk::{ResourceEntry, ResourceKind, YandexError},
+};
 
 const TTL: Duration = Duration::from_secs(2);
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(5);
 const DOWNLOAD_URL_TTL: Duration = Duration::from_secs(300);
-const ROOT_PATH: &str = "disk:/";
 
 trait RemoteClient: Send + Sync {
     fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError>;
@@ -34,50 +36,8 @@ trait RemoteClient: Send + Sync {
     fn read_file_range(&self, href: &str, offset: u64, size: u32) -> Result<Vec<u8>, YandexError>;
 }
 
-impl RemoteClient for YandexDiskClient {
-    fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
-        YandexDiskClient::fetch_resource_metadata(self, path)
-    }
-
-    fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError> {
-        YandexDiskClient::list_directory(self, path)
-    }
-
-    fn create_directory(&self, path: &str) -> Result<(), YandexError> {
-        YandexDiskClient::create_directory(self, path)
-    }
-
-    fn delete_resource(&self, path: &str, permanently: bool) -> Result<(), YandexError> {
-        YandexDiskClient::delete_resource(self, path, permanently)
-    }
-
-    fn move_resource(&self, from: &str, to: &str, overwrite: bool) -> Result<(), YandexError> {
-        YandexDiskClient::move_resource(self, from, to, overwrite)
-    }
-
-    fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
-        YandexDiskClient::resolve_download_url(self, path)
-    }
-
-    fn resolve_upload_url(&self, path: &str, overwrite: bool) -> Result<String, YandexError> {
-        YandexDiskClient::resolve_upload_url(self, path, overwrite)
-    }
-
-    fn upload_file(&self, href: &str, local_path: &std::path::Path) -> Result<(), YandexError> {
-        YandexDiskClient::upload_file(self, href, local_path)
-    }
-
-    fn download_file(&self, href: &str) -> Result<Vec<u8>, YandexError> {
-        YandexDiskClient::download_file(self, href)
-    }
-
-    fn read_file_range(&self, href: &str, offset: u64, size: u32) -> Result<Vec<u8>, YandexError> {
-        YandexDiskClient::read_file_range(self, href, offset, size)
-    }
-}
-
 pub struct YandexDiskFs {
-    client: Arc<dyn RemoteClient>,
+    sync: Arc<SyncService>,
     state: Mutex<FsState>,
     uid: u32,
     gid: u32,
@@ -140,8 +100,10 @@ enum FsError {
     NotDir,
     IsDir,
     AlreadyExists,
+    NotEmpty,
     BadHandle,
     Io(std::io::Error),
+    Sync(SyncError),
     Remote(YandexError),
 }
 
@@ -154,6 +116,19 @@ impl From<YandexError> for FsError {
 impl From<std::io::Error> for FsError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<SyncError> for FsError {
+    fn from(value: SyncError) -> Self {
+        match value {
+            SyncError::NotFound => Self::NotFound,
+            SyncError::NotDir => Self::NotDir,
+            SyncError::IsDir => Self::IsDir,
+            SyncError::AlreadyExists => Self::AlreadyExists,
+            SyncError::DirectoryNotEmpty => Self::NotEmpty,
+            other => Self::Sync(other),
+        }
     }
 }
 
@@ -173,15 +148,15 @@ enum DownloadUrlPlan {
 }
 
 impl YandexDiskFs {
-    pub fn new(client: YandexDiskClient, uid: u32, gid: u32) -> Result<Self, YandexError> {
-        Self::with_client(Arc::new(client), uid, gid)
+    pub fn new(sync: Arc<SyncService>, uid: u32, gid: u32) -> Result<Self, SyncError> {
+        Self::with_sync(sync, uid, gid)
     }
 
-    fn with_client(client: Arc<dyn RemoteClient>, uid: u32, gid: u32) -> Result<Self, YandexError> {
-        let root = client.fetch_resource_metadata(ROOT_PATH)?;
+    fn with_sync(sync: Arc<SyncService>, uid: u32, gid: u32) -> Result<Self, SyncError> {
+        let root = sync.get_entry(ROOT_PATH)?.ok_or(SyncError::NotFound)?;
         let state = FsState::new(root);
         Ok(Self {
-            client,
+            sync,
             state: Mutex::new(state),
             uid,
             gid,
@@ -254,18 +229,7 @@ impl YandexDiskFs {
             return Ok(Vec::new());
         }
 
-        let href = self.download_url_for(ino)?;
-        match self.client.read_file_range(&href, offset, size) {
-            Ok(bytes) => Ok(bytes),
-            Err(YandexError::Forbidden)
-            | Err(YandexError::Unauthorized)
-            | Err(YandexError::NotFound) => {
-                self.invalidate_download_url(ino);
-                let refreshed = self.download_url_for(ino)?;
-                Ok(self.client.read_file_range(&refreshed, offset, size)?)
-            }
-            Err(err) => Err(err.into()),
-        }
+        Ok(self.sync.read_range(&entry.path, offset, size)?)
     }
 
     fn read_handle_data(&self, fh: FileHandle, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
@@ -277,69 +241,44 @@ impl YandexDiskFs {
     }
 
     fn ensure_entry_fresh(&self, ino: INodeNo) -> Result<Entry, FsError> {
-        loop {
-            let plan = {
-                let state = self.state.lock().unwrap();
-                state.entry_refresh_plan(ino)?
-            };
-
-            match plan {
-                EntryRefreshPlan::Ready(entry) => return Ok(entry),
-                EntryRefreshPlan::Fetch { path, parent } => {
-                    let fresh = self.client.fetch_resource_metadata(&path)?;
-                    let mut state = self.state.lock().unwrap();
-                    state.upsert_entry(parent, fresh);
-                }
-            }
+        let snapshot = {
+            let state = self.state.lock().unwrap();
+            state.entries.get(&ino).cloned().ok_or(FsError::NotFound)?
+        };
+        if {
+            let state = self.state.lock().unwrap();
+            state.has_active_write_handle(ino)
+        } {
+            return Ok(snapshot);
         }
+
+        let Some(stored) = self.sync.get_entry(&snapshot.path)? else {
+            return Err(FsError::NotFound);
+        };
+
+        let mut state = self.state.lock().unwrap();
+        state.refresh_entry_from_stored(ino, stored)?;
+        state.entries.get(&ino).cloned().ok_or(FsError::NotFound)
     }
 
     fn ensure_directory_loaded(&self, ino: INodeNo) -> Result<(), FsError> {
-        loop {
-            let entry = self.ensure_entry_fresh(ino)?;
-            if entry.kind != EntryKind::Directory {
-                return Err(FsError::NotDir);
-            }
-
-            let plan = {
-                let state = self.state.lock().unwrap();
-                state.directory_load_plan(ino)?
-            };
-
-            match plan {
-                DirectoryLoadPlan::Ready => return Ok(()),
-                DirectoryLoadPlan::Fetch { path } => {
-                    let children = self.client.list_directory(&path)?;
-                    let mut state = self.state.lock().unwrap();
-                    state.replace_directory_children(ino, children);
-                }
-            }
+        let entry = self.ensure_entry_fresh(ino)?;
+        if entry.kind != EntryKind::Directory {
+            return Err(FsError::NotDir);
         }
+
+        let children = self.sync.list_children(&entry.path)?;
+        let mut state = self.state.lock().unwrap();
+        state.replace_directory_children_from_stored(ino, children);
+        Ok(())
     }
 
     fn download_url_for(&self, ino: INodeNo) -> Result<String, FsError> {
-        loop {
-            let plan = {
-                let state = self.state.lock().unwrap();
-                state.download_url_plan(ino)?
-            };
-
-            match plan {
-                DownloadUrlPlan::Ready(url) => return Ok(url),
-                DownloadUrlPlan::Fetch { path } => {
-                    let url = self.client.resolve_download_url(&path)?;
-                    let mut state = self.state.lock().unwrap();
-                    state.cache_download_url(ino, url.clone())?;
-                    return Ok(url);
-                }
-            }
-        }
+        let entry = self.ensure_entry_fresh(ino)?;
+        Ok(entry.path)
     }
 
-    fn invalidate_download_url(&self, ino: INodeNo) {
-        let mut state = self.state.lock().unwrap();
-        state.invalidate_download_url(ino);
-    }
+    fn invalidate_download_url(&self, _ino: INodeNo) {}
 
     fn has_write_handle(&self, fh: FileHandle) -> bool {
         let state = self.state.lock().unwrap();
@@ -364,8 +303,7 @@ impl YandexDiskFs {
         let initial = if entry.size == 0 {
             Vec::new()
         } else {
-            let href = self.download_url_for(ino)?;
-            self.client.download_file(&href)?
+            self.sync.load_local_bytes(&entry.path)?
         };
         let staging_path = create_staging_file(&initial)?;
         if truncate {
@@ -405,49 +343,25 @@ impl YandexDiskFs {
         if parent_entry.kind != EntryKind::Directory {
             return Err(FsError::NotDir);
         }
-        let path = join_remote_path(&parent_entry.path, name);
+        let stored = self.sync.create_file(&parent_entry.path, name)?;
         let staging_path = create_staging_file(&[])?;
 
         let mut state = self.state.lock().unwrap();
-        if state.path_to_ino.contains_key(&path)
-            || state
-                .dir_children
-                .get(&parent)
-                .and_then(|children| children.get(name))
-                .is_some()
-        {
-            return Err(FsError::AlreadyExists);
-        }
-
-        let now = SystemTime::now();
-        let ino = state.allocate_ino();
+        let ino = state.upsert_stored_entry(parent, stored.clone());
+        let entry = state.entries.get(&ino).cloned().ok_or(FsError::NotFound)?;
         let fh = state.allocate_file_handle();
-        let entry = Entry {
-            ino,
-            parent,
-            path: path.clone(),
-            name: name.to_owned(),
-            kind: EntryKind::File,
-            size: 0,
-            created: now,
-            modified: now,
-            cached_at: Instant::now(),
-            download_url: None,
-            download_url_cached_at: None,
-            remote_present: false,
-        };
-        state.entries.insert(ino, entry.clone());
         state.write_handles.insert(
             fh,
             WriteHandleState {
                 ino,
                 parent,
-                path,
+                path: stored.path,
                 staging_path,
                 dirty: false,
                 is_new: true,
             },
         );
+        state.mark_directory_loaded_stale(parent);
         Ok((entry, fh))
     }
 
@@ -512,12 +426,12 @@ impl YandexDiskFs {
             return Ok(());
         }
 
-        let href = self.client.resolve_upload_url(&snapshot.path, true)?;
-        self.client.upload_file(&href, &snapshot.staging_path)?;
-        let fresh = self.client.fetch_resource_metadata(&snapshot.path)?;
+        let fresh = self
+            .sync
+            .apply_local_file_from_staging(&snapshot.path, &snapshot.staging_path)?;
 
         let mut state = self.state.lock().unwrap();
-        state.apply_committed_resource(fh, fresh)?;
+        state.apply_committed_stored(fh, fresh)?;
         Ok(())
     }
 
@@ -539,12 +453,10 @@ impl YandexDiskFs {
         if parent_entry.kind != EntryKind::Directory {
             return Err(FsError::NotDir);
         }
-        let path = join_remote_path(&parent_entry.path, name);
-        self.client.create_directory(&path)?;
-        let fresh = self.client.fetch_resource_metadata(&path)?;
+        let fresh = self.sync.mkdir(&parent_entry.path, name)?;
 
         let mut state = self.state.lock().unwrap();
-        let ino = state.upsert_entry(parent, fresh);
+        let ino = state.upsert_stored_entry(parent, fresh);
         state.mark_directory_loaded_stale(parent);
         state.entries.get(&ino).cloned().ok_or(FsError::NotFound)
     }
@@ -557,7 +469,7 @@ impl YandexDiskFs {
             _ => {}
         }
 
-        self.client.delete_resource(&entry.path, true)?;
+        self.sync.unlink(&entry.path, expect_dir)?;
         let mut state = self.state.lock().unwrap();
         state.remove_entry_recursive(entry.ino);
         state.mark_directory_loaded_stale(parent);
@@ -579,8 +491,7 @@ impl YandexDiskFs {
         let new_path = join_remote_path(&new_parent_entry.path, newname);
         let old_path = entry.path.clone();
 
-        self.client.move_resource(&old_path, &new_path, true)?;
-        let fresh = self.client.fetch_resource_metadata(&new_path)?;
+        self.sync.rename(&old_path, &new_path)?;
 
         let mut state = self.state.lock().unwrap();
         if let Some(existing) = state.path_to_ino.get(&new_path).copied() {
@@ -589,7 +500,6 @@ impl YandexDiskFs {
             }
         }
         state.rename_entry_subtree(entry.ino, newparent, newname, &new_path);
-        state.upsert_entry(newparent, fresh);
         state.mark_directory_loaded_stale(parent);
         state.mark_directory_loaded_stale(newparent);
         Ok(())
@@ -744,9 +654,7 @@ impl Filesystem for YandexDiskFs {
         };
         match self.mkdir_entry(parent, name) {
             Ok(entry) => reply.entry(&TTL, &self.attr_for(&entry), Generation(0)),
-            Err(FsError::Remote(YandexError::Conflict(_))) | Err(FsError::AlreadyExists) => {
-                reply.error(Errno::EEXIST)
-            }
+            Err(FsError::AlreadyExists) => reply.error(Errno::EEXIST),
             Err(err) => reply.error(errno_for(&err)),
         }
     }
@@ -769,7 +677,7 @@ impl Filesystem for YandexDiskFs {
         };
         match self.unlink_entry(parent, name, true) {
             Ok(()) => reply.ok(),
-            Err(FsError::Remote(YandexError::Conflict(_))) => reply.error(Errno::ENOTEMPTY),
+            Err(FsError::NotEmpty) => reply.error(Errno::ENOTEMPTY),
             Err(err) => reply.error(errno_for(&err)),
         }
     }
@@ -918,7 +826,7 @@ impl Filesystem for YandexDiskFs {
 }
 
 impl FsState {
-    fn new(root: ResourceEntry) -> Self {
+    fn new(root: StoredEntry) -> Self {
         let mut state = Self {
             next_ino: 2,
             next_fh: 1,
@@ -929,7 +837,7 @@ impl FsState {
             write_handles: HashMap::new(),
         };
 
-        let root_entry = Entry::from_resource(INodeNo::ROOT, INodeNo::ROOT, root);
+        let root_entry = Entry::from_stored(INodeNo::ROOT, INodeNo::ROOT, root);
         state.entries.insert(INodeNo::ROOT, root_entry);
         state
             .path_to_ino
@@ -1062,6 +970,22 @@ impl FsState {
         self.dir_cache_time.insert(parent, Instant::now());
     }
 
+    fn replace_directory_children_from_stored(
+        &mut self,
+        parent: INodeNo,
+        children: Vec<StoredEntry>,
+    ) {
+        let mut mapped = BTreeMap::new();
+        for child in children {
+            let name = child.name.clone();
+            let child_ino = self.upsert_stored_entry(parent, child);
+            mapped.insert(name, child_ino);
+        }
+
+        self.dir_children.insert(parent, mapped);
+        self.dir_cache_time.insert(parent, Instant::now());
+    }
+
     fn cache_download_url(&mut self, ino: INodeNo, url: String) -> Result<(), FsError> {
         let entry = self.entries.get_mut(&ino).ok_or(FsError::NotFound)?;
         if entry.kind != EntryKind::File {
@@ -1095,6 +1019,38 @@ impl FsState {
         self.path_to_ino.insert(path, ino);
         self.entries.insert(ino, entry);
         ino
+    }
+
+    fn upsert_stored_entry(&mut self, parent: INodeNo, stored: StoredEntry) -> INodeNo {
+        if let Some(&ino) = self.path_to_ino.get(&stored.path) {
+            if let Some(entry) = self.entries.get_mut(&ino) {
+                entry.parent = parent;
+                entry.update_from_stored(stored);
+            }
+            return ino;
+        }
+
+        let ino = self.allocate_ino();
+        let path = stored.path.clone();
+        let entry = Entry::from_stored(ino, parent, stored);
+        self.path_to_ino.insert(path, ino);
+        self.entries.insert(ino, entry);
+        ino
+    }
+
+    fn refresh_entry_from_stored(
+        &mut self,
+        ino: INodeNo,
+        stored: StoredEntry,
+    ) -> Result<(), FsError> {
+        let entry = self.entries.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let old_path = entry.path.clone();
+        entry.update_from_stored(stored.clone());
+        if old_path != stored.path {
+            self.path_to_ino.remove(&old_path);
+            self.path_to_ino.insert(stored.path, ino);
+        }
+        Ok(())
     }
 
     fn write_handle_snapshot(&self, fh: FileHandle) -> Result<WriteHandleSnapshot, FsError> {
@@ -1138,6 +1094,31 @@ impl FsState {
         entry.update_from_resource(fresh.clone());
         entry.remote_present = true;
         self.path_to_ino.insert(fresh.path.clone(), ino);
+        let handle = self.write_handles.get_mut(&fh).ok_or(FsError::BadHandle)?;
+        handle.path = fresh.path.clone();
+        handle.dirty = false;
+        handle.is_new = false;
+        self.mark_directory_loaded_stale(parent);
+        Ok(())
+    }
+
+    fn apply_committed_stored(
+        &mut self,
+        fh: FileHandle,
+        fresh: StoredEntry,
+    ) -> Result<(), FsError> {
+        let (ino, parent) = {
+            let handle = self.write_handles.get(&fh).ok_or(FsError::BadHandle)?;
+            (handle.ino, handle.parent)
+        };
+        let entry = self.entries.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let old_path = entry.path.clone();
+        entry.parent = parent;
+        entry.update_from_stored(fresh.clone());
+        if old_path != fresh.path {
+            self.path_to_ino.remove(&old_path);
+            self.path_to_ino.insert(fresh.path.clone(), ino);
+        }
         let handle = self.write_handles.get_mut(&fh).ok_or(FsError::BadHandle)?;
         handle.path = fresh.path.clone();
         handle.dirty = false;
@@ -1222,6 +1203,31 @@ impl FsState {
 }
 
 impl Entry {
+    fn from_stored(ino: INodeNo, parent: INodeNo, stored: StoredEntry) -> Self {
+        let created = stored
+            .mtime
+            .and_then(|mtime| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(mtime as u64)))
+            .unwrap_or_else(SystemTime::now);
+        let modified = created;
+        Self {
+            ino,
+            parent,
+            path: stored.path,
+            name: stored.name,
+            kind: match stored.kind {
+                NodeKind::Directory => EntryKind::Directory,
+                NodeKind::File => EntryKind::File,
+            },
+            size: stored.size,
+            created,
+            modified,
+            cached_at: Instant::now(),
+            download_url: None,
+            download_url_cached_at: None,
+            remote_present: !stored.remote_deleted,
+        }
+    }
+
     fn from_resource(ino: INodeNo, parent: INodeNo, resource: ResourceEntry) -> Self {
         let created = resource
             .created
@@ -1271,6 +1277,29 @@ impl Entry {
             self.download_url = None;
             self.download_url_cached_at = None;
         }
+    }
+
+    fn update_from_stored(&mut self, stored: StoredEntry) {
+        self.path = stored.path;
+        self.name = stored.name;
+        self.kind = match stored.kind {
+            NodeKind::Directory => EntryKind::Directory,
+            NodeKind::File => EntryKind::File,
+        };
+        self.size = stored.size;
+        if let Some(mtime) = stored
+            .mtime
+            .and_then(|value| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(value as u64)))
+        {
+            self.created = mtime;
+            self.modified = mtime;
+        } else {
+            self.modified = SystemTime::now();
+        }
+        self.cached_at = Instant::now();
+        self.remote_present = !stored.remote_deleted;
+        self.download_url = None;
+        self.download_url_cached_at = None;
     }
 }
 
@@ -1335,8 +1364,11 @@ fn errno_for(error: &FsError) -> Errno {
         FsError::NotDir => Errno::ENOTDIR,
         FsError::IsDir => Errno::EISDIR,
         FsError::AlreadyExists => Errno::EEXIST,
+        FsError::NotEmpty => Errno::ENOTEMPTY,
         FsError::BadHandle => Errno::EBADF,
         FsError::Io(_) => Errno::EIO,
+        FsError::Sync(SyncError::Conflict(_)) => Errno::EEXIST,
+        FsError::Sync(_) => Errno::EIO,
         FsError::Remote(YandexError::NotFound) => Errno::ENOENT,
         FsError::Remote(YandexError::Unauthorized)
         | FsError::Remote(YandexError::Forbidden)
@@ -1590,6 +1622,7 @@ mod tests {
                     size: bytes.len() as u64,
                     created: Some(SystemTime::UNIX_EPOCH),
                     modified: Some(SystemTime::UNIX_EPOCH),
+                    remote_version: Some(format!("rev:{path}")),
                 },
             );
             let href = format!("download://{path}");
@@ -1637,6 +1670,44 @@ mod tests {
         }
     }
 
+    impl crate::sync::RemoteSyncClient for FakeClient {
+        fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError> {
+            RemoteClient::fetch_resource_metadata(self, path)
+        }
+
+        fn list_directory(&self, path: &str) -> Result<Vec<ResourceEntry>, YandexError> {
+            RemoteClient::list_directory(self, path)
+        }
+
+        fn create_directory(&self, path: &str) -> Result<(), YandexError> {
+            RemoteClient::create_directory(self, path)
+        }
+
+        fn delete_resource(&self, path: &str, permanently: bool) -> Result<(), YandexError> {
+            RemoteClient::delete_resource(self, path, permanently)
+        }
+
+        fn move_resource(&self, from: &str, to: &str, overwrite: bool) -> Result<(), YandexError> {
+            RemoteClient::move_resource(self, from, to, overwrite)
+        }
+
+        fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
+            RemoteClient::resolve_download_url(self, path)
+        }
+
+        fn resolve_upload_url(&self, path: &str, overwrite: bool) -> Result<String, YandexError> {
+            RemoteClient::resolve_upload_url(self, path, overwrite)
+        }
+
+        fn upload_file(&self, href: &str, local_path: &std::path::Path) -> Result<(), YandexError> {
+            RemoteClient::upload_file(self, href, local_path)
+        }
+
+        fn download_file(&self, href: &str) -> Result<Vec<u8>, YandexError> {
+            RemoteClient::download_file(self, href)
+        }
+    }
+
     fn dir(path: &str, name: &str) -> ResourceEntry {
         ResourceEntry {
             path: path.to_owned(),
@@ -1645,6 +1716,7 @@ mod tests {
             size: 0,
             created: Some(SystemTime::UNIX_EPOCH),
             modified: Some(SystemTime::UNIX_EPOCH),
+            remote_version: Some(format!("dir:{path}")),
         }
     }
 
@@ -1656,11 +1728,26 @@ mod tests {
             size,
             created: Some(SystemTime::UNIX_EPOCH),
             modified: Some(SystemTime::UNIX_EPOCH),
+            remote_version: Some(format!("rev:{path}:{size}")),
         }
     }
 
     fn fresh_fs(client: Arc<FakeClient>) -> Arc<YandexDiskFs> {
-        Arc::new(YandexDiskFs::with_client(client, 1000, 1000).unwrap())
+        let remote: Arc<dyn crate::sync::RemoteSyncClient> = client;
+        let sync = crate::sync::SyncService::open_at(
+            env::temp_dir().join(format!("discohack-fs-test-{:016x}", random::<u64>())),
+            remote,
+            PathBuf::from("/tmp/discohack-fs-test"),
+        )
+        .unwrap();
+        sync.start_background();
+        for _ in 0..20 {
+            if sync.get_entry("disk:/fast.txt").unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Arc::new(YandexDiskFs::with_sync(sync, 1000, 1000).unwrap())
     }
 
     #[test]
@@ -1680,13 +1767,10 @@ mod tests {
             fs.read_data(looked_up.ino, None, 0, 11).unwrap(),
             b"hello world"
         );
-        assert_eq!(
-            client
-                .fetch_resource_metadata("disk:/new.txt")
-                .unwrap()
-                .size,
-            11
-        );
+        let stored = fs.sync.get_entry("disk:/new.txt").unwrap().unwrap();
+        assert_eq!(stored.size, 11);
+        assert_eq!(stored.sync_state, crate::sync::SyncState::QueuedUpload);
+        assert!(client.fetch_resource_metadata("disk:/new.txt").is_err());
     }
 
     #[test]
@@ -1738,14 +1822,27 @@ mod tests {
     fn failed_commit_keeps_remote_contents_authoritative() {
         let client = FakeClient::with_fixture();
         client.fail_upload_for("disk:/fast.txt");
-        let fs = fresh_fs(client);
+        let fs = fresh_fs(Arc::clone(&client));
 
         let fast = fs.lookup_entry(INodeNo::ROOT, "fast.txt").unwrap();
         let fh = fs.open_file_handle(fast.ino, true, true).unwrap();
         fs.write_handle_data(fh, 0, b"broken").unwrap();
-        let err = fs.commit_write_handle(fh).unwrap_err();
-        assert!(matches!(err, FsError::Remote(YandexError::Forbidden)));
-        assert_eq!(fs.read_data(fast.ino, None, 0, 4).unwrap(), b"fast");
+        fs.commit_write_handle(fh).unwrap();
+        fs.finish_write_handle(fh, true).unwrap();
+        assert_eq!(fs.read_data(fast.ino, None, 0, 6).unwrap(), b"broken");
+        let mut stored = fs.sync.get_entry("disk:/fast.txt").unwrap().unwrap();
+        for _ in 0..100 {
+            if stored.sync_state == crate::sync::SyncState::Error {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+            stored = fs.sync.get_entry("disk:/fast.txt").unwrap().unwrap();
+        }
+        assert_eq!(stored.sync_state, crate::sync::SyncState::Error);
+        assert_eq!(
+            client.download_file("download://fast.txt").unwrap(),
+            b"fast-content"
+        );
     }
 
     #[test]
