@@ -1371,6 +1371,10 @@ impl SyncService {
                 )?;
                 continue;
             }
+            if local.sync_state == SyncState::Conflict {
+                // Conflict copies are intentionally local-only until the user resolves them.
+                continue;
+            }
             if has_unsynced_local_changes(local) {
                 apply_conflict_locked(&tx, local, local.remote_version.clone(), None, None)?;
                 continue;
@@ -2389,6 +2393,61 @@ mod tests {
 
         assert!(service.get_entry(&path).unwrap().is_some());
         assert!(service.get_entry("disk:/fast (2).txt").unwrap().is_some());
+    }
+
+    #[test]
+    fn conflict_copy_survives_later_refreshes() {
+        let remote = FakeRemoteClient::with_fixture();
+        let service_a = SyncService::open_at(
+            temp_state_dir(),
+            remote.clone() as Arc<dyn RemoteSyncClient>,
+            PathBuf::from("/tmp/discohack-a"),
+        )
+        .unwrap();
+        let service_b = SyncService::open_at(
+            temp_state_dir(),
+            remote.clone() as Arc<dyn RemoteSyncClient>,
+            PathBuf::from("/tmp/discohack-b"),
+        )
+        .unwrap();
+
+        if let Some(job) = service_a.lease_next_operation().unwrap() {
+            service_a.process_operation(job).unwrap();
+        }
+        if let Some(job) = service_b.lease_next_operation().unwrap() {
+            service_b.process_operation(job).unwrap();
+        }
+
+        let path = join_remote_path(ROOT_PATH, "fast.txt");
+        let staging_a = temp_state_dir().join("fast-a.txt");
+        let staging_b = temp_state_dir().join("fast-b.txt");
+        fs::write(&staging_a, b"chips offline a\n").unwrap();
+        fs::write(&staging_b, b"chips offline b\n").unwrap();
+
+        service_a
+            .apply_local_file_from_staging(&path, &staging_a)
+            .unwrap();
+        service_b
+            .apply_local_file_from_staging(&path, &staging_b)
+            .unwrap();
+
+        let job_b = service_b.lease_next_operation().unwrap().unwrap();
+        service_b.process_operation(job_b).unwrap();
+
+        let job_a = service_a.lease_next_operation().unwrap().unwrap();
+        service_a.process_operation(job_a).unwrap();
+
+        assert!(service_a.get_entry(&path).unwrap().is_some());
+        assert!(service_a.get_entry("disk:/fast (2).txt").unwrap().is_some());
+
+        service_a.request_refresh(ROOT_PATH).unwrap();
+        let refresh_job = service_a.lease_next_operation().unwrap().unwrap();
+        service_a.process_operation(refresh_job).unwrap();
+
+        let conflict_copy = service_a.get_entry("disk:/fast (2).txt").unwrap();
+        assert!(conflict_copy.is_some());
+        let bytes = service_a.load_local_bytes("disk:/fast (2).txt").unwrap();
+        assert_eq!(bytes, b"chips offline a\n");
     }
 
     #[test]
