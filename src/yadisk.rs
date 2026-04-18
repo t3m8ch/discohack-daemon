@@ -1,10 +1,11 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, fs::File, path::Path, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode,
-    blocking::{Client, RequestBuilder, Response},
+    blocking::{Body, Client, RequestBuilder, Response},
     header::{AUTHORIZATION, RANGE},
+    redirect::Policy,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -32,7 +33,7 @@ impl AccessTokenProvider for AuthManager {
 #[derive(Clone)]
 pub struct YandexDiskClient {
     api: Client,
-    downloads: Client,
+    transfers: Client,
     auth: Arc<dyn AccessTokenProvider>,
 }
 
@@ -60,8 +61,12 @@ pub enum YandexError {
     Unauthorized,
     #[error("Yandex Disk access denied")]
     Forbidden,
+    #[error("Yandex Disk reported a resource conflict: {0}")]
+    Conflict(String),
     #[error("authentication unavailable: {0}")]
     Auth(#[from] AuthError),
+    #[error("local I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("invalid Yandex Disk response: {0}")]
     InvalidResponse(String),
     #[error("HTTP request failed: {0}")]
@@ -77,14 +82,15 @@ impl YandexDiskClient {
             .timeout(Duration::from_secs(60))
             .build()?;
 
-        let downloads = Client::builder()
+        let transfers = Client::builder()
             .user_agent(USER_AGENT)
+            .redirect(Policy::limited(10))
             .timeout(Duration::from_secs(300))
             .build()?;
 
         Ok(Self {
             api,
-            downloads,
+            transfers,
             auth,
         })
     }
@@ -133,20 +139,85 @@ impl YandexDiskClient {
         Ok(items)
     }
 
+    pub fn create_directory(&self, path: &str) -> Result<(), YandexError> {
+        let response = self.send_authorized_request(|client| {
+            client
+                .put(format!("{API_BASE}/resources"))
+                .query(&[("path", path)])
+        })?;
+        Self::expect_success_or_operation(response)?;
+        Ok(())
+    }
+
+    pub fn delete_resource(&self, path: &str, permanently: bool) -> Result<(), YandexError> {
+        let response = self.send_authorized_request(|client| {
+            client.delete(format!("{API_BASE}/resources")).query(&[
+                ("path", path),
+                ("permanently", if permanently { "true" } else { "false" }),
+            ])
+        })?;
+
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+
+        Self::expect_success_or_operation(response)?;
+        Ok(())
+    }
+
+    pub fn move_resource(&self, from: &str, to: &str, overwrite: bool) -> Result<(), YandexError> {
+        let response = self.send_authorized_request(|client| {
+            client.post(format!("{API_BASE}/resources/move")).query(&[
+                ("from", from),
+                ("path", to),
+                ("overwrite", if overwrite { "true" } else { "false" }),
+            ])
+        })?;
+        Self::expect_success_or_operation(response)?;
+        Ok(())
+    }
+
     pub fn resolve_download_url(&self, path: &str) -> Result<String, YandexError> {
-        let response: DownloadResponse = self.send_json(|client| {
+        let response: TransferLink = self.send_json(|client| {
             client
                 .get(format!("{API_BASE}/resources/download"))
                 .query(&[("path", path)])
         })?;
 
-        if response.href.trim().is_empty() {
-            return Err(YandexError::InvalidResponse(format!(
-                "download URL for {path} is empty"
-            )));
+        expect_non_empty_href(response.href, "download")
+    }
+
+    pub fn resolve_upload_url(&self, path: &str, overwrite: bool) -> Result<String, YandexError> {
+        let response: TransferLink = self.send_json(|client| {
+            client.get(format!("{API_BASE}/resources/upload")).query(&[
+                ("path", path),
+                ("overwrite", if overwrite { "true" } else { "false" }),
+            ])
+        })?;
+
+        expect_non_empty_href(response.href, "upload")
+    }
+
+    pub fn upload_file(&self, href: &str, local_path: &Path) -> Result<(), YandexError> {
+        let file = File::open(local_path)?;
+        let response = self.transfers.put(href).body(Body::new(file)).send()?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
 
-        Ok(response.href)
+        Err(Self::error_from_response(response)?)
+    }
+
+    pub fn download_file(&self, href: &str) -> Result<Vec<u8>, YandexError> {
+        let response = self.transfers.get(href).send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::error_from_response(response)?);
+        }
+
+        Ok(response.bytes()?.to_vec())
     }
 
     pub fn read_file_range(
@@ -161,7 +232,7 @@ impl YandexDiskClient {
 
         let end = offset.saturating_add(size as u64).saturating_sub(1);
         let response = self
-            .downloads
+            .transfers
             .get(href)
             .header(RANGE, format!("bytes={offset}-{end}"))
             .send()?;
@@ -221,6 +292,24 @@ impl YandexDiskClient {
             .send()?)
     }
 
+    fn expect_success_or_operation(response: Response) -> Result<TransferLink, YandexError> {
+        let status = response.status();
+        if status.is_success() {
+            if status == StatusCode::NO_CONTENT {
+                return Ok(TransferLink {
+                    href: String::new(),
+                    method: String::new(),
+                    templated: false,
+                });
+            }
+
+            let link: TransferLink = response.json()?;
+            return Ok(link);
+        }
+
+        Err(Self::error_from_response(response)?)
+    }
+
     fn error_from_response(response: Response) -> Result<YandexError, YandexError> {
         let status = response.status();
         let body = response
@@ -230,6 +319,7 @@ impl YandexDiskClient {
             StatusCode::NOT_FOUND => YandexError::NotFound,
             StatusCode::UNAUTHORIZED => YandexError::Unauthorized,
             StatusCode::FORBIDDEN => YandexError::Forbidden,
+            StatusCode::CONFLICT => YandexError::Conflict(body),
             _ => YandexError::Status { status, body },
         };
         Err(error)
@@ -256,8 +346,10 @@ struct ApiEmbedded {
 }
 
 #[derive(Debug, Deserialize)]
-struct DownloadResponse {
+struct TransferLink {
     href: String,
+    method: String,
+    templated: bool,
 }
 
 impl ApiResource {
@@ -284,6 +376,16 @@ impl ApiResource {
     }
 }
 
+fn expect_non_empty_href(href: String, operation: &str) -> Result<String, YandexError> {
+    if href.trim().is_empty() {
+        return Err(YandexError::InvalidResponse(format!(
+            "{operation} URL is empty"
+        )));
+    }
+
+    Ok(href)
+}
+
 fn parse_time(value: Option<&str>) -> Option<std::time::SystemTime> {
     let raw = value?;
     let parsed = DateTime::parse_from_rfc3339(raw).ok()?;
@@ -297,5 +399,33 @@ impl fmt::Display for ResourceKind {
             ResourceKind::Directory => write!(f, "dir"),
             ResourceKind::File => write!(f, "file"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_blank_transfer_href() {
+        let err = expect_non_empty_href(String::from("   "), "upload").unwrap_err();
+        assert!(matches!(err, YandexError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn reject_unsupported_resource_type() {
+        let err = ApiResource {
+            path: String::from("disk:/weird"),
+            name: String::from("weird"),
+            kind: String::from("weird"),
+            size: None,
+            created: None,
+            modified: None,
+            embedded: None,
+        }
+        .try_into_resource()
+        .unwrap_err();
+
+        assert!(matches!(err, YandexError::InvalidResponse(_)));
     }
 }

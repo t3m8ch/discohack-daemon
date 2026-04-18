@@ -72,10 +72,7 @@ impl MountManager {
 
         let fs = YandexDiskFs::new(self.client.clone(), self.uid, self.gid)?;
         let mut config = Config::default();
-        config.mount_options = vec![
-            MountOption::RO,
-            MountOption::FSName("yandex-disk-ro".into()),
-        ];
+        config.mount_options = vec![MountOption::FSName("yandex-disk".into())];
         let worker_threads = configure_fuse_session(&mut config);
 
         info!(

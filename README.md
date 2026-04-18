@@ -1,6 +1,6 @@
 # discohack-daemon
 
-Read-only FUSE mount for Yandex Disk.
+FUSE mount for Yandex Disk with read and write support.
 
 ## Requirements
 
@@ -44,11 +44,14 @@ Startup behavior:
 - if stored credentials already exist in Secret Service, it can mount immediately
 - otherwise it stays alive with `IsAuth = false` until login completes
 
-After successful login the daemon mounts Yandex Disk automatically. Then inspect the mounted filesystem:
+After successful login the daemon mounts Yandex Disk automatically. Then inspect and modify the mounted filesystem:
 
 ```bash
 ls -la /tmp/yadisk-mnt
 cat /tmp/yadisk-mnt/some-file.txt
+echo hello > /tmp/yadisk-mnt/hello.txt
+mkdir -p /tmp/yadisk-mnt/new-dir
+mv /tmp/yadisk-mnt/hello.txt /tmp/yadisk-mnt/new-dir/hello.txt
 ```
 
 Stop the daemon with `Ctrl-C` or `SIGTERM` for a graceful shutdown. The daemon now attempts to unmount the FUSE mount before exiting so the same mountpoint can be reused immediately.
@@ -74,25 +77,27 @@ RUST_LOG=debug cargo run -- /tmp/yadisk-mnt
 
 - Exposes `disk:/` as the mount root
 - Supports directory traversal via `lookup`, `getattr`, and `readdir`
-- Supports read-only file opens and reads
-- Uses short-lived metadata caching to reduce repeated API calls
-- Resolves file download URLs through the Yandex Disk API and reads file bytes over HTTP
+- Supports regular file reads through Yandex Disk download URLs
+- Supports writable opens, file creation, writes, truncation, flush/fsync commit, and release-time commit
+- Supports `mkdir`, `unlink`, `rmdir`, and `rename`
+- Uses short-lived metadata and download-URL caching to reduce repeated API calls
+- Uses local staging files for writable handles and uploads the full staged file back to Yandex Disk on commit
+
+## Save semantics
+
+Writes are implemented as a write-back filesystem:
+
+- opening an existing file for write stages the current remote contents in a local temp file
+- `write` and `truncate` modify that staged file locally
+- `flush`, `fsync`, and final `release` upload the whole staged file back to Yandex Disk
+- a failed upload returns an error and leaves the previous remote contents authoritative
 
 ## Limitations
 
-This first version is intentionally read-only.
-
-Unsupported operations are rejected with read-only filesystem errors, including:
-
-- create
-- write
-- rename
-- unlink
-- mkdir
-- rmdir
-- setattr / truncate
-
-Large files depend on HTTP performance and remote byte-range support. If the direct download endpoint ignores byte ranges, the daemon falls back to downloading the response body and slicing the requested window.
+- Writes are whole-file uploads, not remote block patches
+- Large writes depend on local temp storage and full upload latency
+- `mknod` and other advanced filesystem operations are still not implemented
+- Behavior for complex concurrent mutation patterns follows a practical first implementation rather than full POSIX parity in every edge case
 
 # Authentication
 
