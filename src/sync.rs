@@ -363,28 +363,13 @@ impl SyncService {
     }
 
     pub fn request_refresh(&self, path: &str) -> Result<(), SyncError> {
-        let requested = self
-            .get_entry(path)?
-            .ok_or(SyncError::NotFound)
-            .or_else(|_| self.get_entry(ROOT_PATH)?.ok_or(SyncError::NotFound))?;
-        let refresh_path = if requested.kind == NodeKind::Directory || path == ROOT_PATH {
-            requested.path.clone()
-        } else {
-            requested
-                .parent_path
-                .clone()
-                .unwrap_or_else(|| ROOT_PATH.to_owned())
-        };
         let entry = self
-            .get_entry(&refresh_path)?
+            .get_entry(ROOT_PATH)?
             .ok_or(SyncError::NotFound)
             .or_else(|_| self.get_entry(ROOT_PATH)?.ok_or(SyncError::NotFound))?;
-        let op_type = if refresh_path == ROOT_PATH {
-            QueueOpType::RefreshTree
-        } else {
-            QueueOpType::RefreshDir
-        };
-        let payload = json!({ "path": refresh_path });
+        let _ = path;
+        let op_type = QueueOpType::RefreshTree;
+        let payload = json!({ "path": ROOT_PATH });
         let mut conn = self.db.lock().unwrap();
         upsert_operation(&mut conn, &entry.file_id, op_type, &payload, false, false)?;
         self.bump_status_version();
@@ -1189,17 +1174,7 @@ impl SyncService {
     }
 
     fn process_refresh_dir(&self, job: QueuedOperation) -> Result<(), SyncError> {
-        let payload = parse_payload(&job.payload_json);
-        let path = payload
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(ROOT_PATH);
-        let children = self.client.list_directory(path)?;
-        self.reconcile_remote_tree(children)?;
-        let mut conn = self.db.lock().unwrap();
-        self.mark_job_done_locked(&mut conn, job.id)?;
-        self.bump_status_version();
-        Ok(())
+        self.process_refresh_tree(job)
     }
 
     fn process_download(&self, job: QueuedOperation) -> Result<(), SyncError> {
@@ -1757,12 +1732,12 @@ fn ensure_remote_row(
              parent_path = excluded.parent_path,
              name = excluded.name,
              kind = excluded.kind,
-             sync_state = CASE WHEN files.sync_state IN (?14, ?15, ?16) THEN files.sync_state ELSE excluded.sync_state END,
-             content_state = excluded.content_state,
+             sync_state = CASE WHEN files.sync_state IN (?14, ?15, ?16, ?17, ?18) THEN files.sync_state ELSE excluded.sync_state END,
+             content_state = CASE WHEN files.sync_state IN (?14, ?15, ?16, ?17, ?18) THEN files.content_state ELSE excluded.content_state END,
              remote_version = excluded.remote_version,
-             mtime = excluded.mtime,
-             size = excluded.size,
-             cache_path = excluded.cache_path,
+             mtime = CASE WHEN files.sync_state IN (?14, ?15, ?16, ?17, ?18) THEN files.mtime ELSE excluded.mtime END,
+             size = CASE WHEN files.sync_state IN (?14, ?15, ?16, ?17, ?18) THEN files.size ELSE excluded.size END,
+             cache_path = CASE WHEN files.sync_state IN (?14, ?15, ?16, ?17, ?18) THEN files.cache_path ELSE excluded.cache_path END,
              last_remote_check_at = excluded.last_remote_check_at,
              remote_deleted = 0,
              last_error = CASE WHEN files.sync_state = ?16 THEN files.last_error ELSE NULL END",
@@ -1784,8 +1759,10 @@ fn ensure_remote_row(
             cache_path,
             now_unix(),
             SyncState::QueuedUpload as i32,
+            SyncState::Uploading as i32,
             SyncState::QueuedDelete as i32,
             SyncState::Conflict as i32,
+            SyncState::Error as i32,
         ],
     )?;
     Ok(())
