@@ -56,6 +56,8 @@ pub enum AuthError {
     NoPendingLogin,
     #[error("authentication is required")]
     AuthenticationRequired,
+    #[error("PKCE random generator failed: {0}")]
+    Random(String),
     #[error("failed to build authorize URL: {0}")]
     Url(#[from] url::ParseError),
     #[error("HTTP request failed: {0}")]

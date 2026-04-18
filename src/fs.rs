@@ -32,6 +32,7 @@ struct FsState {
 
 #[derive(Clone)]
 struct EntryRef {
+    ino: INodeNo,
     path: String,
     parent: INodeNo,
     kind: FileKind,
@@ -580,6 +581,7 @@ impl FsState {
         entries.insert(
             INodeNo::ROOT,
             EntryRef {
+                ino: INodeNo::ROOT,
                 path: root.path.clone(),
                 parent: INodeNo::ROOT,
                 kind: root.kind,
@@ -609,6 +611,7 @@ impl FsState {
         self.entries.insert(
             ino,
             EntryRef {
+                ino,
                 path: node.path.clone(),
                 parent: parent_ino.unwrap_or(INodeNo::ROOT),
                 kind: node.kind,

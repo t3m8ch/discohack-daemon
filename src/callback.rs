@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -111,4 +111,10 @@ async fn handle_oauth_callback(
         )
             .into_response(),
     }
+}
+
+pub fn callback_socket_addr() -> SocketAddr {
+    CALLBACK_BIND_ADDR
+        .parse()
+        .expect("valid callback bind address")
 }

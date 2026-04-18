@@ -9,7 +9,7 @@ use std::{
 };
 
 use rand::random;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -205,19 +205,13 @@ pub struct LocalNode {
     pub kind: FileKind,
     pub size: u64,
     pub mtime: SystemTime,
-    #[allow(dead_code)]
     pub sync_state: SyncState,
-    #[allow(dead_code)]
     pub remote_version: Option<String>,
     pub remote_path: Option<String>,
-    #[allow(dead_code)]
     pub local_version: i64,
-    #[allow(dead_code)]
     pub synced_local_version: i64,
     pub content_status: ContentStatus,
-    #[allow(dead_code)]
     pub cache_rel_path: Option<String>,
-    #[allow(dead_code)]
     pub is_deleted: bool,
 }
 
@@ -299,6 +293,7 @@ struct FileRow {
     is_deleted: bool,
     remote_path: Option<String>,
     children_cached: bool,
+    updated_at: i64,
 }
 
 impl SyncService {
@@ -358,13 +353,11 @@ impl SyncService {
 
     pub fn start_worker(self: &Arc<Self>) -> thread::JoinHandle<()> {
         let service = Arc::clone(self);
-        thread::spawn(move || {
-            loop {
-                match service.process_one_operation() {
-                    Ok(true) => continue,
-                    Ok(false) => thread::sleep(WORKER_POLL_INTERVAL),
-                    Err(_) => thread::sleep(WORKER_POLL_INTERVAL),
-                }
+        thread::spawn(move || loop {
+            match service.process_one_operation() {
+                Ok(true) => continue,
+                Ok(false) => thread::sleep(WORKER_POLL_INTERVAL),
+                Err(_) => thread::sleep(WORKER_POLL_INTERVAL),
             }
         })
     }
@@ -1019,15 +1012,15 @@ impl SyncService {
         let path = row.path.clone();
         let cache_path = self.ensure_cached(&row.file_id)?;
 
-        if let Some(remote_path) = row.remote_path.clone()
-            && remote_path != path
-        {
-            self.client.move_resource(&remote_path, &path, true)?;
-            let db = self.db.lock().unwrap();
-            db.execute(
-                "UPDATE files SET remote_path = ?2, updated_at = ?3 WHERE file_id = ?1",
-                params![row.file_id, path, unix_now()],
-            )?;
+        if let Some(remote_path) = row.remote_path.clone() {
+            if remote_path != path {
+                self.client.move_resource(&remote_path, &path, true)?;
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "UPDATE files SET remote_path = ?2, updated_at = ?3 WHERE file_id = ?1",
+                    params![row.file_id, path, unix_now()],
+                )?;
+            }
         }
 
         match self.client.fetch_resource_metadata(&path) {
@@ -1506,7 +1499,7 @@ impl SyncService {
     }
 
     fn notify_change(&self) {
-        self.change_tx.send_modify(|value| *value += 1);
+        let _ = self.change_tx.send_modify(|value| *value += 1);
     }
 }
 
@@ -1675,6 +1668,7 @@ fn file_row_from_row(row: &rusqlite::Row<'_>) -> Result<FileRow, rusqlite::Error
         is_deleted: row.get::<_, i64>(13)? != 0,
         remote_path: row.get(14)?,
         children_cached: row.get::<_, i64>(15)? != 0,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -2137,11 +2131,12 @@ pub fn increment_conflict_name(path: &str) -> String {
 }
 
 fn parse_conflict_suffix(stem: &str) -> (&str, u32) {
-    if let Some(prefix) = stem.strip_suffix(')')
-        && let Some((base, number)) = prefix.rsplit_once(" (")
-        && let Ok(parsed) = number.parse::<u32>()
-    {
-        return (base, parsed + 1);
+    if let Some(prefix) = stem.strip_suffix(')') {
+        if let Some((base, number)) = prefix.rsplit_once(" (") {
+            if let Ok(parsed) = number.parse::<u32>() {
+                return (base, parsed + 1);
+            }
+        }
     }
     (stem, 2)
 }
@@ -2556,11 +2551,9 @@ mod tests {
         assert!(summary.active_count >= 1);
         assert_eq!(summary.conflict_count, 0);
         let items = service.sync_items_snapshot().unwrap();
-        assert!(
-            items
-                .iter()
-                .any(|item| item.path == "disk:/dbus.txt" && item.state == "queued")
-        );
+        assert!(items
+            .iter()
+            .any(|item| item.path == "disk:/dbus.txt" && item.state == "queued"));
     }
 
     #[test]
