@@ -25,6 +25,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const LEASE_TIMEOUT_SECS: i64 = 30;
 const MAX_SYNC_ITEMS: usize = 32;
+const STALE_REFRESH_INTERVAL_SECS: i64 = 30;
 
 pub trait RemoteSyncClient: Send + Sync {
     fn fetch_resource_metadata(&self, path: &str) -> Result<ResourceEntry, YandexError>;
@@ -362,16 +363,28 @@ impl SyncService {
     }
 
     pub fn request_refresh(&self, path: &str) -> Result<(), SyncError> {
-        let entry = self
+        let requested = self
             .get_entry(path)?
             .ok_or(SyncError::NotFound)
             .or_else(|_| self.get_entry(ROOT_PATH)?.ok_or(SyncError::NotFound))?;
-        let op_type = if path == ROOT_PATH {
+        let refresh_path = if requested.kind == NodeKind::Directory || path == ROOT_PATH {
+            requested.path.clone()
+        } else {
+            requested
+                .parent_path
+                .clone()
+                .unwrap_or_else(|| ROOT_PATH.to_owned())
+        };
+        let entry = self
+            .get_entry(&refresh_path)?
+            .ok_or(SyncError::NotFound)
+            .or_else(|_| self.get_entry(ROOT_PATH)?.ok_or(SyncError::NotFound))?;
+        let op_type = if refresh_path == ROOT_PATH {
             QueueOpType::RefreshTree
         } else {
             QueueOpType::RefreshDir
         };
-        let payload = json!({ "path": path });
+        let payload = json!({ "path": refresh_path });
         let mut conn = self.db.lock().unwrap();
         upsert_operation(&mut conn, &entry.file_id, op_type, &payload, false, false)?;
         self.bump_status_version();
@@ -850,11 +863,10 @@ impl SyncService {
         if entry.kind != NodeKind::File {
             return Err(SyncError::IsDir);
         }
-        if entry.content_state == ContentState::Hydrated {
-            if let Some(cache_path) = &entry.cache_path {
-                if cache_path.exists() {
-                    return Ok(entry);
-                }
+        if let Some(cache_path) = &entry.cache_path {
+            if cache_path.exists() {
+                self.maybe_schedule_stale_refresh(&entry);
+                return Ok(entry);
             }
         }
 
@@ -891,6 +903,20 @@ impl SyncService {
         self.bump_status_version();
         drop(conn);
         self.get_entry(path)?.ok_or(SyncError::NotFound)
+    }
+
+    fn maybe_schedule_stale_refresh(&self, entry: &StoredEntry) {
+        if has_unsynced_local_changes(entry) || entry.sync_state == SyncState::Downloading {
+            return;
+        }
+
+        let now = now_unix();
+        let last_check = entry.last_remote_check_at.unwrap_or(0);
+        if now - last_check < STALE_REFRESH_INTERVAL_SECS {
+            return;
+        }
+
+        let _ = self.request_refresh(&entry.path);
     }
 
     fn recover_expired_leases(&self) -> Result<(), SyncError> {
@@ -1180,8 +1206,44 @@ impl SyncService {
         let entry = self
             .entry_by_file_id(&job.file_id)?
             .ok_or(SyncError::NotFound)?;
-        let _ = self.ensure_hydrated(&entry.path)?;
+        self.set_file_state(&entry.file_id, SyncState::Downloading, None)?;
+        let download_url = match self.client.resolve_download_url(&entry.path) {
+            Ok(download_url) => download_url,
+            Err(err) => return self.retry_or_fail(job, err),
+        };
+        let bytes = match self.client.download_file(&download_url) {
+            Ok(bytes) => bytes,
+            Err(err) => return self.retry_or_fail(job, err),
+        };
+        let cache_path = entry
+            .cache_path
+            .clone()
+            .unwrap_or_else(|| self.cache_path_for(&entry.file_id));
+        if let Some(parent_dir) = cache_path.parent() {
+            fs::create_dir_all(parent_dir)?;
+        }
+        fs::write(&cache_path, &bytes)?;
+
         let mut conn = self.db.lock().unwrap();
+        conn.execute(
+            "UPDATE files SET
+                content_state = ?2,
+                cache_path = ?3,
+                size = ?4,
+                mtime = ?5,
+                sync_state = ?6,
+                last_error = NULL,
+                last_remote_check_at = ?5
+             WHERE file_id = ?1",
+            params![
+                entry.file_id,
+                ContentState::Hydrated as i32,
+                cache_path.to_string_lossy().to_string(),
+                bytes.len() as i64,
+                now_unix(),
+                SyncState::Synced as i32,
+            ],
+        )?;
         self.mark_job_done_locked(&mut conn, job.id)?;
         self.bump_status_version();
         Ok(())
@@ -1278,9 +1340,8 @@ impl SyncService {
             entries
         };
 
-        let mut invalidated_cache = Vec::new();
         let mut conn = self.db.lock().unwrap();
-        let tx = conn.transaction()?;
+        let mut tx = conn.transaction()?;
         for remote in remote_map.values() {
             if remote.path == ROOT_PATH {
                 ensure_remote_row(&tx, remote, SyncState::Synced)?;
@@ -1302,8 +1363,19 @@ impl SyncService {
                 }
 
                 if local.remote_version != remote.remote_version {
-                    if let Some(cache_path) = &local.cache_path {
-                        invalidated_cache.push(cache_path.clone());
+                    if local.cache_path.is_some() && remote.kind == ResourceKind::File {
+                        ensure_remote_row(&tx, remote, SyncState::Downloading)?;
+                        if let Some(updated) = query_entry_by_path(&tx, &remote.path)? {
+                            upsert_operation(
+                                &mut tx,
+                                &updated.file_id,
+                                QueueOpType::Download,
+                                &json!({ "path": remote.path }),
+                                false,
+                                false,
+                            )?;
+                        }
+                        continue;
                     }
                 }
                 ensure_remote_row(&tx, remote, SyncState::Synced)?;
@@ -1333,15 +1405,11 @@ impl SyncService {
                 params![local.file_id],
             )?;
             if let Some(cache_path) = &local.cache_path {
-                invalidated_cache.push(cache_path.clone());
+                let _ = fs::remove_file(cache_path);
             }
         }
 
         tx.commit()?;
-        drop(conn);
-        for path in invalidated_cache {
-            let _ = fs::remove_file(path);
-        }
         self.bump_status_version();
         Ok(())
     }
@@ -1582,7 +1650,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedOperation> {
 }
 
 fn upsert_operation(
-    conn: &mut Connection,
+    conn: &Connection,
     file_id: &str,
     op_type: QueueOpType,
     payload: &Value,
@@ -1672,11 +1740,8 @@ fn ensure_remote_row(
         .map(|path| path.to_string_lossy().to_string());
     let content_state = if existing
         .as_ref()
-        .map(|entry| {
-            entry.content_state == ContentState::Hydrated
-                && entry.remote_version == remote.remote_version
-        })
-        .unwrap_or(false)
+        .and_then(|entry| entry.cache_path.as_ref())
+        .is_some()
     {
         ContentState::Hydrated
     } else {
