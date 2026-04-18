@@ -1,7 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Mutex,
     thread,
 };
 
@@ -9,14 +9,14 @@ use fuser::{BackgroundSession, Config, MountOption};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
-use crate::{fs::YandexDiskFs, sync::SyncService};
+use crate::{fs::YandexDiskFs, yadisk::YandexDiskClient};
 
 const MIN_FUSE_WORKER_THREADS: usize = 2;
 const MAX_FUSE_WORKER_THREADS: usize = 8;
 
 pub struct MountManager {
     mountpoint: PathBuf,
-    sync: Arc<SyncService>,
+    client: YandexDiskClient,
     uid: u32,
     gid: u32,
     session: Mutex<Option<BackgroundSession>>,
@@ -25,7 +25,7 @@ pub struct MountManager {
 #[derive(Debug, Error)]
 pub enum MountError {
     #[error("failed to initialize filesystem: {0}")]
-    Filesystem(#[from] crate::sync::SyncError),
+    Filesystem(#[from] crate::yadisk::YandexError),
     #[error("failed to mount filesystem: {0}")]
     Mount(#[source] io::Error),
     #[error("failed to stop filesystem: {0}")]
@@ -33,10 +33,10 @@ pub enum MountError {
 }
 
 impl MountManager {
-    pub fn new(mountpoint: PathBuf, sync: Arc<SyncService>, uid: u32, gid: u32) -> Self {
+    pub fn new(mountpoint: PathBuf, client: YandexDiskClient, uid: u32, gid: u32) -> Self {
         Self {
             mountpoint,
-            sync,
+            client,
             uid,
             gid,
             session: Mutex::new(None),
@@ -70,7 +70,7 @@ impl MountManager {
             }
         }
 
-        let fs = YandexDiskFs::new(self.sync.clone(), self.uid, self.gid)?;
+        let fs = YandexDiskFs::new(self.client.clone(), self.uid, self.gid)?;
         let mut config = Config::default();
         config.mount_options = vec![MountOption::FSName("yandex-disk".into())];
         let worker_threads = configure_fuse_session(&mut config);

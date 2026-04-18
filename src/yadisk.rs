@@ -51,7 +51,6 @@ pub struct ResourceEntry {
     pub size: u64,
     pub created: Option<std::time::SystemTime>,
     pub modified: Option<std::time::SystemTime>,
-    pub remote_version: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -336,8 +335,6 @@ struct ApiResource {
     size: Option<u64>,
     created: Option<String>,
     modified: Option<String>,
-    revision: Option<serde_json::Value>,
-    etag: Option<String>,
     #[serde(rename = "_embedded")]
     embedded: Option<ApiEmbedded>,
 }
@@ -375,13 +372,6 @@ impl ApiResource {
             size: self.size.unwrap_or(0),
             created: parse_time(self.created.as_deref()),
             modified: parse_time(self.modified.as_deref()),
-            remote_version: self
-                .revision
-                .map(|value| match value {
-                    serde_json::Value::String(raw) => raw,
-                    other => other.to_string(),
-                })
-                .or(self.etag),
         })
     }
 }
@@ -431,8 +421,6 @@ mod tests {
             size: None,
             created: None,
             modified: None,
-            revision: None,
-            etag: None,
             embedded: None,
         }
         .try_into_resource()

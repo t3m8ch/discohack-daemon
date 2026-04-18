@@ -4,20 +4,16 @@ mod dbus_service;
 mod fs;
 mod mount;
 mod secrets;
-mod sync;
 mod yadisk;
 
 use std::{env, path::PathBuf, process, sync::Arc};
 
 use auth::{AuthManager, YANDEX_CLIENT_ID, YandexOAuthClient};
 use callback::{CallbackEvent, spawn_callback_server};
-use dbus_service::{
-    build_connection, emit_login_completed, emit_sync_items_changed, emit_sync_summary_changed,
-};
+use dbus_service::{build_connection, emit_login_completed};
 use dotenvy::dotenv;
 use mount::MountManager;
 use secrets::SecretServiceStore;
-use sync::SyncService;
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::mpsc,
@@ -118,24 +114,7 @@ async fn run() -> i32 {
 
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
-    let sync = match task::spawn_blocking(move || SyncService::new(client.clone())).await {
-        Ok(Ok(sync)) => sync,
-        Ok(Err(err)) => {
-            error!(error = %err, "failed to initialize offline-first sync state");
-            return 1;
-        }
-        Err(err) => {
-            error!(error = %err, "sync initialization task failed");
-            return 1;
-        }
-    };
-    let _worker = sync.start_worker();
-    let mount_manager = Arc::new(MountManager::new(
-        mountpoint.clone(),
-        sync.clone(),
-        uid,
-        gid,
-    ));
+    let mount_manager = Arc::new(MountManager::new(mountpoint.clone(), client, uid, gid));
 
     let (callback_tx, mut callback_rx) = mpsc::channel(8);
     let callback_handle = match spawn_callback_server(auth.clone(), callback_tx).await {
@@ -146,7 +125,7 @@ async fn run() -> i32 {
         }
     };
 
-    let connection = match build_connection(auth.clone(), sync.clone()).await {
+    let connection = match build_connection(auth.clone()).await {
         Ok(connection) => connection,
         Err(err) => {
             error!(error = %err, "failed to start D-Bus service");
@@ -155,14 +134,11 @@ async fn run() -> i32 {
         }
     };
 
-    let has_local_state = sync.has_local_state().unwrap_or(false);
-    if auth.is_authenticated() || has_local_state {
+    if auth.is_authenticated() {
         ensure_mount_started(Arc::clone(&mount_manager)).await;
     }
 
-    let mut sync_changes = sync.subscribe_changes();
-
-    info!(service = dbus_service::BUS_NAME, mountpoint = %mountpoint.display(), authenticated = auth.is_authenticated(), cached_state = has_local_state, "service ready");
+    info!(service = dbus_service::BUS_NAME, mountpoint = %mountpoint.display(), authenticated = auth.is_authenticated(), "service ready");
 
     let mut sigint = match signal(SignalKind::interrupt()) {
         Ok(signal) => signal,
@@ -202,28 +178,11 @@ async fn run() -> i32 {
 
                 match event {
                     CallbackEvent::LoginCompleted => {
-                        let sync_for_bootstrap = sync.clone();
-                        if let Err(err) = task::spawn_blocking(move || sync_for_bootstrap.ensure_root_available()).await
-                            .unwrap_or_else(|join_err| Err(crate::sync::SyncError::InvalidState(format!("sync bootstrap task failed: {join_err}")))) {
-                            warn!(error = %err, "failed to bootstrap sync root after login");
-                        }
                         ensure_mount_started(Arc::clone(&mount_manager)).await;
                         if let Err(err) = emit_login_completed(&connection).await {
                             warn!(error = %err, "failed to emit LoginCompleted signal");
                         }
                     }
-                }
-            }
-            changed = sync_changes.changed() => {
-                if changed.is_err() {
-                    warn!("sync state change channel closed unexpectedly");
-                    continue;
-                }
-                if let Err(err) = emit_sync_summary_changed(&connection).await {
-                    warn!(error = %err, "failed to emit SyncSummary property change");
-                }
-                if let Err(err) = emit_sync_items_changed(&connection).await {
-                    warn!(error = %err, "failed to emit SyncItems property change");
                 }
             }
         }
