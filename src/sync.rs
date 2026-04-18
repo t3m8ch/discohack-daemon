@@ -1371,8 +1371,8 @@ impl SyncService {
                 )?;
                 continue;
             }
-            if local.sync_state == SyncState::Conflict {
-                // Conflict copies are intentionally local-only until the user resolves them.
+            if is_conflict_copy(&tx, &local.file_id, &local.path)? {
+                // Conflict copies stay stable locally until they are uploaded under their conflict name.
                 continue;
             }
             if has_unsynced_local_changes(local) {
@@ -1793,17 +1793,25 @@ fn apply_conflict_locked(
         now,
     )?;
     conn.execute(
-        "UPDATE files SET sync_state = ?2, last_error = ?3 WHERE file_id = ?1",
-        params![entry.file_id, SyncState::Conflict as i32, "conflict"],
+        "UPDATE files
+         SET sync_state = ?2,
+             remote_version = NULL,
+             remote_deleted = 0,
+             last_error = ?3
+         WHERE file_id = ?1",
+        params![entry.file_id, SyncState::QueuedUpload as i32, "conflict"],
     )?;
     conn.execute(
-        "UPDATE operations_queue SET op_status = ?2, updated_at = ?3 WHERE file_id = ?1 AND op_status != ?4",
-        params![
-            entry.file_id,
-            QueueOpStatus::Conflict as i32,
-            now,
-            QueueOpStatus::Done as i32,
-        ],
+        "DELETE FROM operations_queue WHERE file_id = ?1 AND op_status != ?2",
+        params![entry.file_id, QueueOpStatus::Done as i32,],
+    )?;
+    upsert_operation(
+        conn,
+        &entry.file_id,
+        QueueOpType::Upload,
+        &json!({ "path": conflict_path }),
+        false,
+        false,
     )?;
     conn.execute(
         "INSERT INTO conflicts (
@@ -1861,6 +1869,17 @@ fn rename_subtree(
         )?;
     }
     Ok(())
+}
+
+fn is_conflict_copy(conn: &Connection, file_id: &str, path: &str) -> Result<bool, SyncError> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM conflicts WHERE file_id = ?1 AND conflict_path = ?2 ORDER BY created_at DESC LIMIT 1",
+            params![file_id, path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
 }
 
 fn status_from_entry(entry: StoredEntry) -> StatusEntry {
@@ -2448,6 +2467,62 @@ mod tests {
         assert!(conflict_copy.is_some());
         let bytes = service_a.load_local_bytes("disk:/fast (2).txt").unwrap();
         assert_eq!(bytes, b"chips offline a\n");
+    }
+
+    #[test]
+    fn conflict_copy_uploads_and_becomes_visible_to_other_client() {
+        let remote = FakeRemoteClient::with_fixture();
+        let service_a = SyncService::open_at(
+            temp_state_dir(),
+            remote.clone() as Arc<dyn RemoteSyncClient>,
+            PathBuf::from("/tmp/discohack-a"),
+        )
+        .unwrap();
+        let service_b = SyncService::open_at(
+            temp_state_dir(),
+            remote.clone() as Arc<dyn RemoteSyncClient>,
+            PathBuf::from("/tmp/discohack-b"),
+        )
+        .unwrap();
+
+        if let Some(job) = service_a.lease_next_operation().unwrap() {
+            service_a.process_operation(job).unwrap();
+        }
+        if let Some(job) = service_b.lease_next_operation().unwrap() {
+            service_b.process_operation(job).unwrap();
+        }
+
+        let path = join_remote_path(ROOT_PATH, "fast.txt");
+        let staging_a = temp_state_dir().join("conflict-a.txt");
+        let staging_b = temp_state_dir().join("conflict-b.txt");
+        fs::write(&staging_a, b"offline from a\n").unwrap();
+        fs::write(&staging_b, b"offline from b\n").unwrap();
+
+        service_a
+            .apply_local_file_from_staging(&path, &staging_a)
+            .unwrap();
+        service_b
+            .apply_local_file_from_staging(&path, &staging_b)
+            .unwrap();
+
+        let job_b = service_b.lease_next_operation().unwrap().unwrap();
+        service_b.process_operation(job_b).unwrap();
+
+        let job_a = service_a.lease_next_operation().unwrap().unwrap();
+        service_a.process_operation(job_a).unwrap();
+        assert!(service_a.get_entry("disk:/fast (2).txt").unwrap().is_some());
+
+        let conflict_upload = service_a.lease_next_operation().unwrap().unwrap();
+        service_a.process_operation(conflict_upload).unwrap();
+        assert!(remote.fetch_resource_metadata("disk:/fast (2).txt").is_ok());
+
+        service_b.request_refresh(ROOT_PATH).unwrap();
+        let refresh_job = service_b.lease_next_operation().unwrap().unwrap();
+        service_b.process_operation(refresh_job).unwrap();
+
+        assert!(service_b.get_entry("disk:/fast (2).txt").unwrap().is_some());
+        let bytes = service_b.load_local_bytes("disk:/fast (2).txt").unwrap();
+        assert_eq!(bytes, b"offline from a\n");
     }
 
     #[test]
